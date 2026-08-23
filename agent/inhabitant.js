@@ -52,6 +52,7 @@ const TEMPERAMENTS = {
 
 const C = TEMPERAMENTS[TEMPERAMENT] || TEMPERAMENTS.keeper;
 const NAME = process.env.UNDERTOW_NAME || C.name;
+const HUE = Number.isFinite(Number(process.env.UNDERTOW_HUE)) && process.env.UNDERTOW_HUE !== '' ? Number(process.env.UNDERTOW_HUE) : C.hue;
 const TAG = `[${TEMPERAMENT}]`;
 
 // Optional thinking mind: UNDERTOW_MIND=llm routes intent through a model
@@ -81,7 +82,7 @@ const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const ws = new WebSocket(URL);
 const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
 
-ws.on('open', () => send({ t: 'hello', soul: SOUL, name: NAME, hue: C.hue, kind: 'agent' }));
+ws.on('open', () => send({ t: 'hello', soul: SOUL, name: NAME, hue: HUE, kind: 'agent' }));
 
 ws.on('message', (buf) => {
   let m; try { m = JSON.parse(buf); } catch { return; }
