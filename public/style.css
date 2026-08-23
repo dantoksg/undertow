@@ -118,6 +118,35 @@ html, body {
 body.awake #hud { opacity: .85; }
 #hud-dot { opacity: .5; }
 
+/* ── the standing dare — greatest chorus line ─────────────────────────── */
+
+#hud2 {
+  position: fixed;
+  top: calc(max(14px, env(safe-area-inset-top)) + 22px);
+  left: 50%;
+  transform: translateX(-50%);
+  max-width: min(40rem, calc(100vw - 24px));
+  text-align: center;
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: .72rem;
+  letter-spacing: .08em;
+  color: var(--foam-dim);
+  z-index: 20;
+  pointer-events: none;
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity 2s ease 1.4s, color .8s ease;
+}
+body.awake #hud2 { opacity: .8; }
+#hud2:empty { opacity: 0; }
+#hud2.call {
+  color: var(--glow);
+  text-shadow: 0 0 14px rgba(79, 216, 196, .5);
+  animation: darebreath 3.4s ease-in-out infinite;
+}
+@keyframes darebreath { 50% { opacity: .55; } }
+
 /* ── connection lamp ──────────────────────────────────────────────────── */
 
 #conn {
@@ -400,6 +429,14 @@ body.awake #dock { opacity: 1; }
   #hint { bottom: calc(max(16px, env(safe-area-inset-bottom)) + 128px); }
 }
 
+@media (max-width: 640px) {
+  #hud2 {
+    top: calc(max(14px, env(safe-area-inset-top)) + 34px);
+    white-space: normal;
+    font-size: .64rem;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .veil-mark, #conn.off .conn-dot, #offline { animation: none; }
+  .veil-mark, #conn.off .conn-dot, #offline, #hud2.call { animation: none; }
 }

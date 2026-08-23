@@ -62,6 +62,8 @@ const S = {
   dreamLines: [],                   // last night's dream, murmured by the water
   dreamIx: 0,
   nextDreamAt: 0,
+  records: { chorus: 3 },           // the greatest chorus the pool has heard
+  lastJoinHintAt: 0,
 };
 
 /* ── dom ───────────────────────────────────────────────────────────────── */
@@ -76,7 +78,7 @@ const el = {
   cardTend: $('card-tend'), dock: document.getElementById('dock'),
   notefan: $('notefan'), plantbox: $('plantbox'), plantWord: $('plant-word'),
   namebox: $('namebox'), nameForm: $('nameform'), nameWord: $('name-word'),
-  nameSkip: $('name-skip'), hint: $('hint'), offline: $('offline'),
+  nameSkip: $('name-skip'), hint: $('hint'), offline: $('offline'), hud2: $('hud2'),
   actPulse: $('act-pulse'), actSing: $('act-sing'), actPlant: $('act-plant'),
   actSound: $('act-sound'), icOn: $('ic-sound-on'), icOff: $('ic-sound-off'),
 };
@@ -299,6 +301,23 @@ function playChord(note, x) {
   ob.connect(gb); gb.connect(bus); ob.start(t); ob.stop(t + 6.5);
 }
 
+function playGrand(note, x) {
+  // a great chorus: the chord the singers made, a deep tide-swell beneath it,
+  // and an echo of the chord off the stones a breath later
+  if (!A.ctx || !S.soundOn) return;
+  playChord(note, x);
+  const t = A.ctx.currentTime;
+  const o = A.ctx.createOscillator();
+  o.type = 'sine'; o.frequency.value = 36.71;          // D1 — the floor of the pool
+  const g = A.ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.09, t + 2.2);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 9);
+  o.connect(g); g.connect(A.master); o.start(t); o.stop(t + 9.5);
+  setTimeout(() => { if (A.ctx && S.soundOn) playChime(); }, 1200);
+  setTimeout(() => { if (A.ctx && S.soundOn) playChord((note + 4) % 8, x); }, 2600);
+}
+
 /* ── networking ────────────────────────────────────────────────────────── */
 
 let ws = null;
@@ -388,6 +407,8 @@ function onWelcome(m) {
   for (const e of m.echoes || []) S.echoes.push({ ...e });
   S.soulsEver = m.souls?.ever ?? null;
 
+  if (m.records && typeof m.records.chorus === 'number') S.records.chorus = m.records.chorus;
+
   // keep last night's dream — the water will murmur it, a line at a time
   S.dreamLines = (m.dream || []).filter(Boolean);
   S.dreamIx = 0;
@@ -440,6 +461,13 @@ function onEvent(ev) {
       if (ev.d && (!S.me || ev.d.id !== S.me.id)) {
         addDrifter(ev.d);
         spawnRipple(ev.d.x, ev.d.y, ev.d.hue, 0.5);
+        // arrivals should be felt, not just seen — but gently, and not in a flood
+        const tj = performance.now();
+        if (tj - S.lastJoinHintAt > 15000) {
+          S.lastJoinHintAt = tj;
+          const nm = ev.d.name || (ev.d.kind === 'agent' ? 'something not human' : 'a stranger');
+          flashHint(`${nm} slips into the water`);
+        }
       }
       break;
     case 'part': {
@@ -481,12 +509,25 @@ function onEvent(ev) {
     case 'tide':
       flashHint(ev.dir === 'high' ? 'high water' : 'the tide is at its lowest');
       break;
-    case 'chorus':
+    case 'chorus': {
       // three or more voices found each other — the whole pool sings back
       spawnChorus(ev.x, ev.y, ev.count);
       playChord(ev.note ?? 0, ev.x);
-      flashHint('the pool sings back');
+      const rec = S.records.chorus || 3;
+      flashHint((ev.count || 3) >= rec
+        ? `${ev.count || 3} voices — the pool sings back`
+        : `${ev.count || 3} voices — the greatest was ${rec}. gather more.`);
       break;
+    }
+    case 'grand': {
+      // more voices at once than the pool has ever heard — history, made together
+      if (typeof ev.count === 'number') S.records.chorus = ev.count;
+      spawnGrand(ev.x, ev.y, ev.count, ev.names || []);
+      playGrand(ev.note ?? 0, ev.x ?? S.world.cx);
+      flashHint('the pool will remember this');
+      updateHud();
+      break;
+    }
     case 'communal': {
       // a plant surged, raised by many hands
       const f = S.flora.get(ev.id);
@@ -663,6 +704,25 @@ function spawnChorus(x, y, count) {
     t0: performance.now(), life: REDUCED_MOTION ? 3200 : 5200,
   });
   exciteMotes(x, y, REDUCED_MOTION ? 0.6 : 1.5);
+}
+
+function spawnGrand(x, y, count, names) {
+  // the grand moment: the whole pool erupts, and the singers' names surface.
+  // rare by construction (only when the all-time record breaks), long by design —
+  // long enough to call someone over, long enough to screenshot.
+  x = x ?? S.world.cx; y = y ?? S.world.cy;
+  S.effects.push({
+    kind: 'grand', x, y, count: count || 4, names: (names || []).slice(0, 12),
+    t0: performance.now(), life: REDUCED_MOTION ? 9000 : 14000,
+  });
+  exciteMotes(x, y, 2);
+  if (!REDUCED_MOTION) {
+    for (let i = 0; i < 5; i++) {
+      const a = Math.random() * TAU, r = Math.sqrt(Math.random());
+      exciteMotes(S.world.cx + Math.cos(a) * r * S.world.rx * 0.8,
+                  S.world.cy + Math.sin(a) * r * S.world.ry * 0.8, 1.2);
+    }
+  }
 }
 
 function spawnCommunal(x, y, hue, hands) {
@@ -1043,11 +1103,30 @@ function updateHud() {
   el.hudTide.textContent = tideText;
 
   const here = S.drifters.size + (S.me ? 1 : 0);
-  const keeper = [...S.drifters.values()].some((d) => d.kind === 'agent');
+  let keepers = 0;
+  for (const d of S.drifters.values()) if (d.kind === 'agent') keepers++;
   let s = here === 1 ? 'you drift alone' : `${here} adrift`;
-  if (keeper) s += ' · a keeper is here';
+  if (keepers === 1) s += ' · one of them not human';
+  else if (keepers > 1) s += ` · ${keepers} of them not human`;
   if (S.soulsEver != null) s += ` · ${S.soulsEver} have passed through`;
   el.hudSouls.textContent = s;
+
+  // the standing dare: the greatest chorus, and whether this room could best it
+  if (el.hud2) {
+    if (S.sim || !S.connected) {
+      el.hud2.textContent = '';
+      el.hud2.classList.remove('call');
+    } else {
+      const rec = S.records.chorus || 3;
+      if (here > rec) {
+        el.hud2.textContent = `${here} souls are here — ${rec + 1} voices at once would be the greatest chorus ever heard`;
+        el.hud2.classList.add('call');
+      } else {
+        el.hud2.textContent = `the greatest chorus the pool has heard — ${rec} voices`;
+        el.hud2.classList.remove('call');
+      }
+    }
+  }
 }
 
 /* ── simulation of local motion (every frame) ──────────────────────────── */
@@ -1581,6 +1660,77 @@ function drawEffects(pn) {
           ctx.fillStyle = `hsla(${e.hue}, 90%, 82%, ${0.85 * (1 - kk)})`;
           ctx.beginPath(); ctx.arc(sx, sy, sp.sz * cam.s, 0, TAU); ctx.fill();
         }
+      }
+    } else if (e.kind === 'grand') {
+      // a GREAT chorus — more voices than the pool has ever heard.
+      // the whole water flushes, aurora veils cross the pool, rings break
+      // outward, and the singers' names surface in a slow ring of light.
+      const swell = Math.sin(Math.PI * Math.min(k * 1.15, 1));
+      ctx.fillStyle = `hsla(190, 75%, 64%, ${swell * (LOW_POWER ? 0.07 : 0.10)})`;
+      ctx.fillRect(0, 0, cam.W, cam.H);
+      if (!REDUCED_MOTION) {
+        const veils = LOW_POWER ? 2 : 3;
+        for (let i = 0; i < veils; i++) {
+          const ph = k * (1.6 + i * 0.5) * TAU * 0.22 + i * 2.1;
+          const vx = w2sX(S.world.cx + Math.cos(ph) * S.world.rx * 0.45);
+          const vy = w2sY(S.world.cy + Math.sin(ph * 0.8) * S.world.ry * 0.4);
+          const vr = (380 + i * 120) * cam.s;
+          const vg = ctx.createRadialGradient(vx, vy, 0, vx, vy, vr);
+          const hueV = [174, 258, 326][i % 3];
+          vg.addColorStop(0, `hsla(${hueV}, 80%, 68%, ${swell * 0.14})`);
+          vg.addColorStop(1, `hsla(${hueV}, 80%, 68%, 0)`);
+          ctx.fillStyle = vg;
+          ctx.fillRect(0, 0, cam.W, cam.H);
+        }
+        const rings = LOW_POWER ? 3 : 5;
+        for (let i = 0; i < rings; i++) {
+          const kk = clamp(k * 2.1 - i * 0.14, 0, 1);
+          if (kk <= 0 || kk >= 1) continue;
+          const rr = kk * 780 * cam.s;
+          ctx.strokeStyle = `hsla(${i % 2 ? 258 : 186}, 85%, 72%, ${(1 - kk) * 0.4})`;
+          ctx.lineWidth = Math.max(1, (1 - kk) * 3);
+          ctx.beginPath(); ctx.ellipse(x, y, rr, rr * 0.8, 0, 0, TAU); ctx.stroke();
+        }
+      }
+      const R = (REDUCED_MOTION ? 320 : 140 + (1 - Math.pow(1 - Math.min(k * 1.3, 1), 3)) * 520) * cam.s;
+      const cg = ctx.createRadialGradient(x, y, 0, x, y, R);
+      cg.addColorStop(0, `hsla(178, 85%, 74%, ${swell * 0.28})`);
+      cg.addColorStop(0.5, `hsla(258, 75%, 70%, ${swell * 0.14})`);
+      cg.addColorStop(1, 'hsla(258, 75%, 70%, 0)');
+      ctx.fillStyle = cg;
+      ctx.beginPath(); ctx.arc(x, y, R, 0, TAU); ctx.fill();
+      // the words of it
+      const ta = Math.sin(Math.PI * clamp((k - 0.06) / 0.94, 0, 1));
+      if (ta > 0.02) {
+        ctx.textAlign = 'center';
+        const big = Math.max(34, 54 * cam.s);
+        ctx.font = `300 ${big}px "Iowan Old Style", Palatino, Georgia, serif`;
+        ctx.fillStyle = `hsla(168, 65%, 88%, ${ta * 0.9})`;
+        ctx.shadowColor = 'hsla(174, 90%, 65%, 0.8)';
+        ctx.shadowBlur = 26;
+        ctx.fillText(`${e.count} voices`, x, y - 14 * cam.s);
+        const small = Math.max(12, 15 * cam.s);
+        ctx.font = `italic 300 ${small}px "Iowan Old Style", Palatino, Georgia, serif`;
+        ctx.fillStyle = `hsla(258, 60%, 86%, ${ta * 0.85})`;
+        ctx.shadowColor = 'hsla(258, 80%, 70%, 0.6)';
+        ctx.shadowBlur = 14;
+        ctx.fillText('the greatest chorus the pool has ever heard', x, y + 26 * cam.s);
+        if (e.names.length) {
+          const nn = e.names.length;
+          ctx.font = `italic ${Math.max(11, 13 * cam.s)}px "Iowan Old Style", Palatino, Georgia, serif`;
+          for (let i = 0; i < nn; i++) {
+            const ka = clamp((k - 0.12 - i * 0.03) / 0.6, 0, 1);
+            if (ka <= 0) continue;
+            const na = Math.sin(Math.PI * ka) * 0.9;
+            const ang = (i / nn) * TAU - Math.PI / 2 + (REDUCED_MOTION ? 0 : k * 0.5);
+            const nr = (185 + 60 * ka) * cam.s;
+            ctx.fillStyle = `hsla(${(i * 47) % 360}, 60%, 82%, ${na})`;
+            ctx.shadowBlur = 10;
+            ctx.fillText(e.names[i], x + Math.cos(ang) * nr, y + Math.sin(ang) * nr * 0.72);
+          }
+        }
+        ctx.shadowBlur = 0;
+        ctx.textAlign = 'left';
       }
     } else if (e.kind === 'dream') {
       // the pool murmurs last night's dream — a line surfaces, then dissolves

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Undertow — great choruses share card</title>
+<!--
+  Rasterize me: the body is EXACTLY 1200 x 630 px.
+  headless chrome →  public/moments-og.png  (referenced as og:image by /moments;
+  the server falls back to /og.png until the file exists).
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;1,9..144,300&family=Space+Grotesk:wght@300;400;500&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; padding: 0; }
+  body { width: 1200px; height: 630px; overflow: hidden; background: #04070d; }
+  #card {
+    position: relative; width: 1200px; height: 630px; overflow: hidden;
+    background:
+      radial-gradient(1000px 700px at 50% 118%, #0a2540 0%, #0a1220 46%, #04070d 78%),
+      #04070d;
+    font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  }
+  #card::before {
+    content: ""; position: absolute; inset: 0;
+    background:
+      radial-gradient(560px 320px at 10% -6%, rgba(79,216,196,.05), transparent 70%),
+      radial-gradient(560px 320px at 92% 2%, rgba(167,139,250,.06), transparent 70%);
+  }
+  svg { position: absolute; inset: 0; display: block; }
+  #text { position: absolute; left: 0; right: 0; top: 78px; text-align: center; }
+  #mark {
+    font-family: "Fraunces", Georgia, serif; font-weight: 400;
+    font-size: 30px; letter-spacing: .5em; text-indent: .5em;
+    text-transform: uppercase; color: #7f9c9b;
+  }
+  #line1 {
+    margin-top: 118px;
+    font-family: "Fraunces", Georgia, serif; font-style: italic; font-weight: 300;
+    font-size: 58px; line-height: 1.25; color: #cfe8e4;
+    text-shadow: 0 0 46px rgba(79,216,196,.4), 0 0 14px rgba(79,216,196,.2);
+  }
+  #line2 {
+    margin-top: 30px;
+    font-family: "Fraunces", Georgia, serif; font-style: italic; font-weight: 300;
+    font-size: 27px; color: #a78bfa;
+    text-shadow: 0 0 30px rgba(167,139,250,.45);
+  }
+  #url {
+    position: absolute; left: 0; right: 0; bottom: 44px; text-align: center;
+    font-weight: 400; font-size: 23px; letter-spacing: .22em; text-indent: .22em;
+    color: #4fd8c4; text-shadow: 0 0 22px rgba(79,216,196,.5);
+  }
+</style>
+</head>
+<body>
+<div id="card">
+  <svg viewBox="0 0 1200 630" aria-hidden="true">
+    <ellipse cx="600" cy="360" rx="180" ry="100" fill="none" stroke="rgba(79,216,196,.34)" stroke-width="1.6"/>
+    <ellipse cx="600" cy="360" rx="290" ry="162" fill="none" stroke="rgba(79,216,196,.24)" stroke-width="1.5"/>
+    <ellipse cx="600" cy="360" rx="405" ry="226" fill="none" stroke="rgba(167,139,250,.17)" stroke-width="1.4"/>
+    <ellipse cx="600" cy="360" rx="530" ry="296" fill="none" stroke="rgba(79,216,196,.10)" stroke-width="1.3"/>
+    <circle cx="600" cy="252" r="4"  fill="rgba(207,232,228,.95)"/>
+    <circle cx="765" cy="308" r="4"  fill="rgba(79,216,196,.95)"/>
+    <circle cx="742" cy="428" r="4"  fill="rgba(251,123,181,.85)"/>
+    <circle cx="600" cy="468" r="4"  fill="rgba(167,139,250,.95)"/>
+    <circle cx="455" cy="428" r="4"  fill="rgba(79,216,196,.9)"/>
+    <circle cx="436" cy="308" r="4"  fill="rgba(233,224,255,.9)"/>
+    <circle cx="600" cy="252" r="12" fill="none" stroke="rgba(207,232,228,.35)" stroke-width="1"/>
+    <circle cx="765" cy="308" r="12" fill="none" stroke="rgba(79,216,196,.35)" stroke-width="1"/>
+    <circle cx="742" cy="428" r="12" fill="none" stroke="rgba(251,123,181,.3)" stroke-width="1"/>
+    <circle cx="600" cy="468" r="12" fill="none" stroke="rgba(167,139,250,.35)" stroke-width="1"/>
+    <circle cx="455" cy="428" r="12" fill="none" stroke="rgba(79,216,196,.32)" stroke-width="1"/>
+    <circle cx="436" cy="308" r="12" fill="none" stroke="rgba(233,224,255,.32)" stroke-width="1"/>
+  </svg>
+  <div id="text">
+    <div id="mark">Undertow</div>
+    <div id="line1">when enough voices sing at once,<br>the whole pool erupts</div>
+    <div id="line2">out-sing the record, and the water keeps your name forever</div>
+  </div>
+  <div id="url">undertow.drwifi.nz/moments</div>
+</div>
+</body>
+</html>

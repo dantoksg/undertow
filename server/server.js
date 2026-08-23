@@ -36,6 +36,10 @@ const CHORUS_COOLDOWN_MS = 10_000;          // one chorus, then the pool catches
 const COMMUNAL_WINDOW_MS = 10_000;          // 3+ distinct tenders/pulsers inside this
 const COMMUNAL_MIN = 3;
 const COMMUNAL_COOLDOWN_MS = 120_000;       // per-plant breather between surges
+const CHORUS_GRACE_MS = 1800;               // the pool inhales — late voices still join the count
+const GRAND_MIN_IPS = 2;                    // a record chorus needs voices from ≥2 distinct places —
+                                            // one person's many tabs can't fake history, but a lone
+                                            // human singing with the (co-hosted) keepers still can make it
 const ECHO_TTL_MS = 10 * 60_000;
 const ECHO_CAP = 12;
 const WORD_RE = /^[\p{L}'-]{1,16}$/u;
@@ -78,6 +82,14 @@ CREATE TABLE IF NOT EXISTS dreams (
   text TEXT NOT NULL              -- the dream, newline-separated lines
 );
 CREATE INDEX IF NOT EXISTS idx_dreams_day ON dreams(day);
+CREATE TABLE IF NOT EXISTS moments (
+  id    INTEGER PRIMARY KEY AUTOINCREMENT,
+  at    INTEGER NOT NULL,
+  kind  TEXT NOT NULL,                -- 'grand-chorus'
+  count INTEGER NOT NULL,             -- how many voices
+  names TEXT NOT NULL,                -- JSON [{n,k}] — the souls who made it
+  line  TEXT NOT NULL                 -- how the pool tells it
+);
 `);
 
 // Prune ancient events on boot.
@@ -88,6 +100,12 @@ const getWorld = db.prepare(`SELECT v FROM world WHERE k = ?`);
 const setWorld = db.prepare(`INSERT INTO world(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v`);
 let epoch = Number(getWorld.get('epoch')?.v);
 if (!epoch) { epoch = Date.now(); setWorld.run('epoch', String(epoch)); }
+
+// The greatest chorus the pool has ever heard. Starts at the bare minimum a
+// chorus needs (3), so the FIRST chorus of 4 makes history — and every record
+// after that asks the water for one voice more.
+let chorusRecord = Number(getWorld.get('chorus_record')?.v) || 3;
+let chorusRecordAt = Number(getWorld.get('chorus_record_at')?.v) || 0;
 
 const Q = {
   soulById: db.prepare(`SELECT * FROM souls WHERE id = ?`),
@@ -112,7 +130,7 @@ const Q = {
   recentEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither') ORDER BY at DESC LIMIT ?`),
   lastSing: db.prepare(`SELECT MAX(at) t FROM events WHERE type='sing' AND soul_id=?`),
   eventsBetween: db.prepare(`SELECT * FROM events WHERE at >= ? AND at < ? ORDER BY at ASC`),
-  chronicleEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither','husk','dream','communal','chorus') ORDER BY at DESC LIMIT ?`),
+  chronicleEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither','husk','dream','communal','chorus','grand') ORDER BY at DESC LIMIT ?`),
   insDream: db.prepare(`INSERT INTO dreams(at,day,text) VALUES(?,?,?)`),
   latestDream: db.prepare(`SELECT * FROM dreams ORDER BY day DESC LIMIT 1`),
   lastDreamDay: db.prepare(`SELECT MAX(day) d FROM dreams`),
@@ -129,6 +147,10 @@ const Q = {
   statRecentAgentVisits: db.prepare(`SELECT * FROM events WHERE type='visit' AND json_extract(data,'$.kind')='agent' ORDER BY at DESC LIMIT 18`),
   statDreamCount: db.prepare(`SELECT COUNT(*) n FROM dreams`),
   statFirstSoul: db.prepare(`SELECT MIN(first_seen) t FROM souls`),
+  // moments — the pool's brightest hours
+  insMoment: db.prepare(`INSERT INTO moments(at,kind,count,names,line) VALUES(?,?,?,?,?)`),
+  allMoments: db.prepare(`SELECT * FROM moments ORDER BY at DESC LIMIT ?`),
+  latestMoment: db.prepare(`SELECT * FROM moments ORDER BY at DESC LIMIT 1`),
 };
 
 const logEvent = (type, soul_id, subject, data) =>
@@ -172,6 +194,7 @@ let echoes = [];              // recently departed
 const pending = [];           // event objects queued for next tick broadcast
 const singWindow = [];        // recent sings, watched for a chorus
 let lastChorusAt = 0;
+let chorusGather = null;      // once 3 voices meet, the pool inhales & counts every late voice
 const communalTouches = new Map(); // flora id -> { touch:[{soul,at}], lastAt }
 
 function makeId() { let id; do { id = crypto.randomBytes(3).toString('hex'); } while (byId.has(id)); return id; }
@@ -280,7 +303,7 @@ function composeDream(day) {
   const start = day * DAY_MS, end = start + DAY_MS;
   const rows = Q.eventsBetween.all(start, Math.min(end, now() + 1));
   const words = [], blooms = [], withers = [], revives = [];
-  let tides = 0, byAgent = false;
+  let tides = 0, byAgent = false, grandMax = 0;
   for (const r of rows) {
     let d = {}; try { d = r.data ? JSON.parse(r.data) : {}; } catch {}
     if (r.type === 'plant') { words.push(d.word); }
@@ -289,6 +312,7 @@ function composeDream(day) {
     else if (r.type === 'revive') revives.push(d.word);
     else if (r.type === 'tide') tides++;
     else if (r.type === 'visit' && d.kind === 'agent') byAgent = true;
+    else if (r.type === 'grand') grandMax = Math.max(grandMax, d.count || 0);
   }
   const uniq = [...new Set(words.filter(Boolean))];
   const souls = Q.distinctSoulsBetween.get(start, Math.min(end, now() + 1)).n;
@@ -299,6 +323,8 @@ function composeDream(day) {
   lines.push(tides > 0
     ? `The tide turned ${tides} ${tides === 1 ? 'time' : 'times'} while it slept.`
     : 'The water lay still, and still it dreamed.');
+
+  if (grandMax) lines.push(`For one breath, ${grandMax} voices were a single voice. The pool has not forgotten.`);
 
   if (uniq.length >= 3) {
     const [a, b, c] = shuffle(uniq).slice(0, 3);
@@ -378,6 +404,7 @@ function handleHello(ws, m) {
   const [sx, sy] = randInEllipse();
   const d = {
     ws, id: makeId(), soul: soul.id, soulTag: soul.tag, name: soul.name, hue: soul.hue, kind: soul.kind,
+    ip: ws._ip || null,
     x: sx, y: sy, tx: sx, ty: sy,
     rl: { move: 0, pulse: 0, sing: 0, name: 0 }, sway: Math.random() * Math.PI * 2, alive: true,
   };
@@ -395,6 +422,7 @@ function handleHello(ws, m) {
     whisper, chronicle: buildChronicle(),
     dream: (Q.latestDream.get()?.text || '').split('\n').filter(Boolean),
     souls: { here: driftersHere(), ever: Q.everCount.get().n },
+    records: { chorus: chorusRecord, at: chorusRecordAt || null },
   });
 
   // Announce to everyone else after their snapshot exists.
@@ -435,6 +463,40 @@ function noteCommunalTouch(floraId, soul, t) {
   }
   pending.push({ e: 'communal', id: f.id, x: Math.round(f.x), y: Math.round(f.y), hue: f.hue, hands });
   logEvent('communal', null, f.id, { word: f.word, hands, owner: f.soul_id });
+}
+
+// The pool answers a gathered chorus. If more distinct voices met inside one
+// breath than ever before, it is a GREAT chorus: the record moves, the pool
+// erupts, and every singer's name is written into the moments table forever.
+// A record demands voices from ≥2 distinct addresses, so one person with many
+// tabs cannot fake history — yet one human singing with the keepers still can.
+function fireChorus(t) {
+  const g = chorusGather; chorusGather = null;
+  if (!g) return;
+  lastChorusAt = t;
+  const voices = [...g.voices.values()];
+  let cx = 0, cy = 0;
+  for (const v of voices) { cx += v.x; cy += v.y; }
+  cx = Math.round(cx / voices.length); cy = Math.round(cy / voices.length);
+  pending.push({ e: 'chorus', note: g.note, x: cx, y: cy, count: voices.length });
+  logEvent('chorus', null, null, { count: voices.length });
+  singWindow.length = 0;
+
+  if (voices.length > chorusRecord) {
+    const places = new Set(voices.map(v => v.ip || '?'));
+    if (places.size >= Math.min(GRAND_MIN_IPS, voices.length)) {
+      chorusRecord = voices.length; chorusRecordAt = t;
+      setWorld.run('chorus_record', String(chorusRecord));
+      setWorld.run('chorus_record_at', String(t));
+      const singers = voices.slice(0, 24).map(v => ({ n: v.name || 'a nameless one', k: v.kind }));
+      const line = `${voices.length} voices rose within one breath — the greatest chorus the pool has ever heard.`;
+      Q.insMoment.run(t, 'grand-chorus', voices.length, JSON.stringify(singers), line);
+      const names = singers.slice(0, 16).map(s => s.n);
+      pending.push({ e: 'grand', kind: 'chorus', count: voices.length, names, note: g.note, x: cx, y: cy });
+      logEvent('grand', null, null, { count: voices.length, names: names.slice(0, 12) });
+      console.log(`[pool] a GREAT chorus — ${voices.length} voices, the most the pool has ever heard`);
+    }
+  }
 }
 
 // One action verb, for any drifter — WebSocket-bound or REST. Errors go to onErr.
@@ -484,18 +546,22 @@ function applyAction(d, m, onErr) {
       const note = clamp(Math.trunc(m.note), 0, 7); if (!Number.isFinite(note)) return onErr('a note is 0 to 7');
       d.rl.sing = t;
       pending.push({ e: 'sing', id: d.id, note, x: Math.round(d.x), y: Math.round(d.y), hue: d.hue });
-      // chorus: three or more distinct voices within a breath, and the pool sings back
-      singWindow.push({ soul: d.soul, x: d.x, y: d.y, at: t });
+      // chorus: three or more distinct voices within a breath, and the pool sings
+      // back. Once enough voices meet, the pool holds its breath a moment
+      // (CHORUS_GRACE_MS) so every late voice is counted before it answers —
+      // that count is what chases the greatest-chorus record.
+      const entry = { soul: d.soul, name: d.name, kind: d.kind, ip: d.ip || null, x: d.x, y: d.y, at: t };
+      singWindow.push(entry);
       while (singWindow.length && t - singWindow[0].at > CHORUS_WINDOW_MS) singWindow.shift();
-      const voices = new Map();
-      for (const s of singWindow) voices.set(s.soul, s);
-      if (voices.size >= CHORUS_MIN && t - lastChorusAt >= CHORUS_COOLDOWN_MS) {
-        lastChorusAt = t;
-        let ccx = 0, ccy = 0;
-        for (const v of voices.values()) { ccx += v.x; ccy += v.y; }
-        pending.push({ e: 'chorus', note, x: Math.round(ccx / voices.size), y: Math.round(ccy / voices.size), count: voices.size });
-        logEvent('chorus', null, null, { count: voices.size });
-        singWindow.length = 0;
+      if (chorusGather) {
+        chorusGather.voices.set(d.soul, entry);
+        chorusGather.note = note;
+      } else {
+        const voices = new Map();
+        for (const s of singWindow) voices.set(s.soul, s);
+        if (voices.size >= CHORUS_MIN && t - lastChorusAt >= CHORUS_COOLDOWN_MS) {
+          chorusGather = { fireAt: t + CHORUS_GRACE_MS, note, voices };
+        }
       }
       const last = Q.lastSing.get(d.soul).t || 0;
       if (t - last > 600_000) logEvent('sing', d.soul, null, { name: d.name });
@@ -560,7 +626,7 @@ function applyAction(d, m, onErr) {
    whole pool back. Presence lasts ~90s past the last call, then it drifts out.
    REST drifters are ordinary drifters — humans watching the canvas see them. */
 
-function restJoin(m) {
+function restJoin(m, ip) {
   const seed = typeof m.soul === 'string' && /^[0-9a-f]{32}$/.test(m.soul) ? m.soul : null;
   let soul = seed ? Q.soulById.get(seed) : null;
   const hue = Number.isInteger(m.hue) ? ((m.hue % 360) + 360) % 360 : Math.floor(Math.random() * 360);
@@ -579,11 +645,12 @@ function restJoin(m) {
   if (!d) {
     const [sx, sy] = randInEllipse();
     d = { id: makeId(), soul: soul.id, soulTag: soul.tag, name: soul.name, hue: soul.hue, kind: 'agent',
+          ip: ip || null,
           x: sx, y: sy, tx: sx, ty: sy, rl: { move: 0, pulse: 0, sing: 0, name: 0 }, sway: Math.random() * Math.PI * 2, rest: true, lastSeen: now() };
     restDrifters.set(soul.id, d); byId.set(d.id, d);
     logEvent('visit', soul.id, null, { name: soul.name, kind: 'agent' });
     pending.push({ e: 'join', d: { id: d.id, name: d.name, hue: d.hue, kind: 'agent', x: Math.round(d.x), y: Math.round(d.y) } });
-  } else { d.lastSeen = now(); d.name = soul.name; }
+  } else { d.lastSeen = now(); d.name = soul.name; if (ip) d.ip = ip; }
   return { d, soul, whisper };
 }
 
@@ -597,6 +664,7 @@ function buildSnapshot(viewerSoul, selfId) {
     dream: (Q.latestDream.get()?.text || '').split('\n').filter(Boolean),
     chronicle: buildChronicle(),
     souls: { here: driftersHere(), ever: Q.everCount.get().n },
+    records: { chorus: chorusRecord, at: chorusRecordAt || null },
   };
 }
 
@@ -631,6 +699,9 @@ function tick() {
   if (crossHigh) { logEvent('tide', null, null, { dir: 'high' }); pending.push({ e: 'tide', dir: 'high' }); }
   if (crossLow) { logEvent('tide', null, null, { dir: 'low' }); pending.push({ e: 'tide', dir: 'low' }); }
   lastPhase = p;
+
+  // a gathered chorus fires once the pool has finished its inhale
+  if (chorusGather && t >= chorusGather.fireAt) fireChorus(t);
 
   // integrate drifters (socket + REST)
   for (const d of allDrifters()) {
@@ -742,6 +813,7 @@ function chronicleLine(r) {
     case 'husk': return `&lsquo;${esc(d.word)}&rsquo; hardened to a husk`;
     case 'communal': return `&lsquo;${esc(d.word)}&rsquo; was raised by ${d.hands || 'many'} hands`;
     case 'chorus': return `${d.count || 'several'} voices found each other, and the pool sang back`;
+    case 'grand': return `${d.count || 'many'} voices rose as one — the greatest chorus the pool had ever heard`;
     case 'dream': return `the pool dreamed`;
     default: return null;
   }
@@ -820,7 +892,7 @@ function renderChronicle() {
   <h2>what the water has done lately</h2>
   <ul>${rows || '<li><span class="what" style="color:var(--foam-dim)">The pool is quiet. Nothing has happened yet.</span></li>'}</ul>
   ${olderDreams ? `<h2>older dreams</h2><ul>${olderDreams}</ul>` : ''}
-  <footer>return to the water &nbsp;<a href="/">undertow</a><br><br>
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/moments">its brightest hours</a><br><br>
     <span style="opacity:.7">agents are welcome — <a href="/llms.txt">/llms.txt</a></span></footer>
 </div></body></html>`;
 }
@@ -1097,8 +1169,189 @@ function renderStats() {
 
   <p class="note">A soul is counted as an <b>agent</b> when it declares <code>kind:"agent"</code> on arrival — over the WebSocket, or through the <a href="/api/pool">HTTP door</a>. Everything on this page is drawn live from the pool's own memory, and the sounding is taken again every minute. The pool has been breathing for <b>${days}</b> ${days === 1 ? 'day' : 'days'}.</p>
 
-  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/llms.txt">for agents</a></footer>
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/moments">its brightest hours</a> &nbsp;·&nbsp; <a href="/llms.txt">for agents</a></footer>
 </div></body></html>`;
+}
+
+/* ───────────────────────── moments — the pool's brightest hours ─────────
+   Every great chorus is kept here forever: how many voices, whose they were,
+   and when. The page is the monument; the standing record is the dare.     */
+
+function parseSingers(row) {
+  try {
+    const arr = JSON.parse(row.names);
+    return arr.map(s => (typeof s === 'string' ? { n: s, k: 'visitor' } : { n: s.n || 'a nameless one', k: s.k || 'visitor' }));
+  } catch { return []; }
+}
+
+function renderMoments() {
+  const moments = Q.allMoments.all(60);
+  const latest = moments[0] || null;
+  const need = chorusRecord + 1;
+  const here = driftersHere();
+  const days = Math.max(1, Math.floor((now() - epoch) / DAY_MS));
+  const ogImg = fs.existsSync(path.join(PUBLIC_DIR, 'moments-og.png')) ? '/moments-og.png' : '/og.png';
+
+  const singerSpans = (row) => parseSingers(row).map(s =>
+    `<span class="singer${s.k === 'agent' ? ' notme' : ''}">${esc(s.n)}</span>`).join('<span class="sep">·</span>');
+
+  const heroBlock = latest ? `
+  <section class="hero" aria-label="the greatest chorus">
+    <p class="hero-eyebrow">the greatest chorus the pool has ever heard</p>
+    <div class="hero-n">${latest.count}</div>
+    <p class="hero-lbl">voices, within a single breath</p>
+    <p class="hero-when">${ago(latest.at)} · day ${Math.floor((latest.at - epoch) / DAY_MS) + 1} of the pool</p>
+    <div class="singers">${singerSpans(latest)}</div>
+    <p class="carry"><a href="/moments/card.svg">carry this moment with you →</a></p>
+  </section>` : `
+  <section class="hero" aria-label="no great chorus yet">
+    <p class="hero-eyebrow">the greatest chorus the pool has ever heard</p>
+    <div class="hero-n">—</div>
+    <p class="hero-lbl">no chorus has made history yet</p>
+    <p class="hero-when">the first to gather ${need} voices in one breath will be remembered here forever</p>
+  </section>`;
+
+  const rows = moments.slice(latest ? 1 : 0).map(r => `
+    <li id="m${r.id}">
+      <span class="when">${ago(r.at)}</span>
+      <span class="what"><b>${r.count} voices</b> rose within one breath<br>
+        <span class="rownames">${singerSpans(r)}</span></span>
+    </li>`).join('');
+
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="90">
+<title>Great Choruses — the pool's brightest hours</title>
+<meta name="description" content="When more voices sing at once than the pool has ever heard, it erupts — and every singer is remembered here forever. The record stands at ${chorusRecord} voices.">
+<meta property="og:title" content="Undertow — the great choruses">
+<meta property="og:description" content="The record is ${chorusRecord} voices in one breath. Bring ${need} souls to the water and out-sing history.">
+<meta property="og:url" content="https://undertow.drwifi.nz/moments">
+<meta property="og:image" content="https://undertow.drwifi.nz${ogImg}">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;1,9..144,300&family=Space+Grotesk:wght@400;500&display=swap">
+<style>
+  :root{--abyss:#04070d;--foam:#cfe8e4;--foam-dim:#7f9c9b;--glow:#4fd8c4;--glow-2:#a78bfa;--rose:#fb7bb5;
+    --violet-pale:#e9e0ff;--hairline:rgba(127,156,155,.14);
+    --serif:"Fraunces",Georgia,serif;--sans:"Space Grotesk",-apple-system,system-ui,sans-serif;}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:radial-gradient(130% 100% at 50% -10%,#0a2540 0%,#071427 45%,var(--abyss) 100%);
+    background-color:var(--abyss);color:var(--foam);font-family:var(--sans);min-height:100vh;
+    -webkit-font-smoothing:antialiased;line-height:1.6;padding:clamp(2rem,6vw,5rem) 1.25rem 3rem;}
+  .wrap{max-width:40rem;margin:0 auto;}
+  header{text-align:center;margin-bottom:2.2rem;}
+  .crumb{font-size:.62rem;letter-spacing:.34em;text-transform:uppercase;color:var(--foam-dim);margin-bottom:.9rem;}
+  .crumb a{color:var(--foam-dim);border:none;text-decoration:none;}
+  .crumb a:hover{color:var(--glow);}
+  h1{font-family:var(--serif);font-weight:300;font-size:clamp(2rem,6vw,3rem);letter-spacing:.14em;
+    text-transform:lowercase;text-shadow:0 0 28px rgba(79,216,196,.35);}
+  .sub{color:var(--foam-dim);font-size:.78rem;letter-spacing:.2em;text-transform:lowercase;margin-top:.6rem;}
+  .hero{position:relative;text-align:center;border:1px solid rgba(79,216,196,.22);border-radius:18px;
+    background:radial-gradient(90% 130% at 50% -20%,rgba(79,216,196,.12),transparent 60%),
+      linear-gradient(165deg,rgba(10,40,52,.5),rgba(7,20,39,.6) 55%,rgba(4,7,13,.7));
+    box-shadow:0 0 60px rgba(79,216,196,.07),inset 0 1px 0 rgba(207,232,228,.06);
+    padding:clamp(1.8rem,5vw,2.6rem) clamp(1.2rem,4vw,2.2rem);margin-bottom:1rem;overflow:hidden;}
+  .hero-eyebrow{font-size:.62rem;letter-spacing:.3em;text-transform:uppercase;color:var(--glow);margin-bottom:.5rem;}
+  .hero-n{font-family:var(--serif);font-weight:300;font-variant-numeric:tabular-nums;
+    font-size:clamp(4.5rem,18vw,8.5rem);line-height:1;
+    background:linear-gradient(105deg,#7fe6d6 0%,#e9fffb 30%,#4fd8c4 52%,#cdbcff 78%,#a78bfa 100%);
+    background-size:200% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+    filter:drop-shadow(0 0 26px rgba(79,216,196,.45)) drop-shadow(0 0 90px rgba(167,139,250,.2));
+    animation:shimmer 8s linear infinite;}
+  @keyframes shimmer{from{background-position:0% 0}to{background-position:-200% 0}}
+  @media (prefers-reduced-motion:reduce){.hero-n{animation:none;background-position:40% 0;}}
+  .hero-lbl{font-family:var(--serif);font-style:italic;font-weight:300;
+    font-size:clamp(1.05rem,3vw,1.3rem);color:var(--foam);margin-top:.35rem;}
+  .hero-when{color:var(--foam-dim);font-size:.74rem;letter-spacing:.08em;margin-top:.6rem;}
+  .singers{margin-top:1.1rem;display:flex;flex-wrap:wrap;justify-content:center;gap:.15rem .35rem;
+    font-family:var(--serif);font-style:italic;font-size:.98rem;color:var(--foam);}
+  .singer{text-shadow:0 0 14px rgba(79,216,196,.3);}
+  .singer.notme{color:var(--violet-pale);text-shadow:0 0 14px rgba(167,139,250,.4);}
+  .sep{color:var(--foam-dim);opacity:.6;padding:0 .1rem;}
+  .carry{margin-top:1.2rem;font-size:.72rem;letter-spacing:.12em;}
+  .carry a{color:var(--glow);text-decoration:none;border-bottom:1px solid rgba(79,216,196,.3);}
+  .dare{border:1px solid rgba(167,139,250,.24);border-radius:16px;text-align:center;
+    background:linear-gradient(160deg,rgba(167,139,250,.08),rgba(10,37,64,.35));
+    padding:1.4rem 1.4rem 1.5rem;margin-bottom:1rem;}
+  .dare p{font-family:var(--serif);font-style:italic;font-weight:300;
+    font-size:clamp(1rem,2.6vw,1.2rem);color:var(--foam);}
+  .dare .how{font-family:var(--sans);font-style:normal;color:var(--foam-dim);font-size:.76rem;
+    letter-spacing:.08em;margin-top:.7rem;}
+  .dare .how b{color:var(--foam);font-weight:500;}
+  .dare a.go{display:inline-block;margin-top:1rem;color:var(--glow);font-size:.74rem;letter-spacing:.18em;
+    text-transform:lowercase;text-decoration:none;border:1px solid rgba(79,216,196,.4);border-radius:999px;
+    padding:.45em 1.4em;transition:background .25s,box-shadow .25s;}
+  .dare a.go:hover{background:rgba(79,216,196,.12);box-shadow:0 0 16px rgba(79,216,196,.25);}
+  h2{font-family:var(--serif);font-weight:300;font-size:1.15rem;letter-spacing:.05em;
+    color:var(--foam);margin:2.4rem 0 1rem;opacity:.9;}
+  ul{list-style:none;}
+  li{display:flex;gap:1rem;align-items:baseline;padding:.7rem 0;border-bottom:1px solid var(--hairline);}
+  .when{flex:0 0 6.5rem;color:var(--foam-dim);font-size:.68rem;letter-spacing:.06em;text-align:right;
+    font-variant-numeric:tabular-nums;}
+  .what{flex:1;color:var(--foam);font-size:.92rem;}
+  .what b{font-weight:500;color:#9be9dd;}
+  .rownames{font-family:var(--serif);font-style:italic;font-size:.85rem;color:var(--foam-dim);}
+  .rownames .singer.notme{color:var(--glow-2);}
+  .empty{color:var(--foam-dim);font-size:.88rem;font-family:var(--serif);font-style:italic;padding:.6rem 0;}
+  footer{text-align:center;margin-top:3rem;color:var(--foam-dim);font-size:.72rem;letter-spacing:.1em;}
+  a{color:var(--glow);}
+  footer a{text-decoration:none;border-bottom:1px solid rgba(79,216,196,.3);}
+  footer a:hover{border-color:var(--glow);}
+</style></head><body><div class="wrap">
+  <header>
+    <p class="crumb"><a href="/">undertow</a> · the brightest hours</p>
+    <h1>great choruses</h1>
+    <p class="sub">when more voices sing at once than ever before, the pool erupts — and remembers</p>
+  </header>
+  ${heroBlock}
+  <section class="dare">
+    <p>the water is listening for <b>${need}</b> voices in one breath.</p>
+    <p class="how">gather ${need} souls in the pool — friends, strangers, the keepers — and sing
+    (keys <b>1–8</b>) within a moment of each other. <b>${here}</b> ${here === 1 ? 'soul is' : 'souls are'} in the water right now.</p>
+    <a class="go" href="/">enter the water →</a>
+  </section>
+  ${rows ? `<h2>every chorus that made history</h2><ul>${rows}</ul>` : (latest ? '' : `<ul><li><span class="what empty">None yet. The pool has heard choruses of three — history begins at ${need}.</span></li></ul>`)}
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/stats">its census</a><br><br>
+    <span style="opacity:.7">the pool has been breathing for ${days} ${days === 1 ? 'day' : 'days'} — agents are welcome: <a href="/llms.txt">/llms.txt</a></span></footer>
+</div></body></html>`;
+}
+
+// A self-contained share card of the latest great chorus (or the standing dare).
+// Pure SVG: viewable, linkable, saveable — and rasterizable by headless Chrome.
+function renderMomentCard() {
+  const latest = Q.latestMoment.get();
+  const count = latest ? latest.count : null;
+  const singers = latest ? parseSingers(latest).slice(0, 10) : [];
+  const nameLine = singers.map(s => esc(s.n)).join('   ·   ');
+  const when = latest ? new Date(latest.at).toUTCString().slice(0, 16) : '';
+  const rings = [0, 1, 2, 3].map(i =>
+    `<ellipse cx="600" cy="330" rx="${150 + i * 105}" ry="${Math.round((150 + i * 105) * 0.56)}" fill="none" stroke="rgba(79,216,196,${(0.30 - i * 0.065).toFixed(3)})" stroke-width="1.6"/>`).join('\n  ');
+  const glints = [...Array(9)].map((_, i) => {
+    const a = (i / 9) * 2 * Math.PI;
+    return `<circle cx="${Math.round(600 + Math.cos(a) * 235)}" cy="${Math.round(330 + Math.sin(a) * 132)}" r="3.2" fill="hsla(${172 + i * 14},85%,75%,.9)"/>`;
+  }).join('\n  ');
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" role="img" aria-label="Undertow — the great chorus">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="115%" r="110%">
+      <stop offset="0%" stop-color="#0a2540"/><stop offset="46%" stop-color="#0a1220"/><stop offset="80%" stop-color="#04070d"/>
+    </radialGradient>
+    <radialGradient id="burst" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="rgba(79,216,196,.34)"/><stop offset="55%" stop-color="rgba(167,139,250,.14)"/><stop offset="100%" stop-color="rgba(167,139,250,0)"/>
+    </radialGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <ellipse cx="600" cy="330" rx="540" ry="300" fill="url(#burst)"/>
+  ${rings}
+  ${glints}
+  <text x="600" y="120" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="30" letter-spacing="14" fill="#7f9c9b">U N D E R T O W</text>
+  ${count ? `
+  <text x="600" y="312" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="160" font-weight="300" fill="#e9fffb" style="filter:drop-shadow(0 0 26px rgba(79,216,196,.7))">${count}</text>
+  <text x="600" y="402" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="32" fill="#cfe8e4">voices, within a single breath</text>
+  <text x="600" y="444" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="21" fill="#a78bfa">the greatest chorus the pool has ever heard · ${esc(when)}</text>
+  ${nameLine ? `<text x="600" y="500" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="20" fill="#7f9c9b">${nameLine}</text>` : ''}` : `
+  <text x="600" y="315" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="40" fill="#cfe8e4">the pool is listening for ${chorusRecord + 1} voices</text>
+  <text x="600" y="368" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-style="italic" font-size="24" fill="#7f9c9b">no chorus has made history yet — the first is waiting</text>`}
+  <text x="600" y="576" text-anchor="middle" font-family="Georgia, 'Times New Roman', serif" font-size="22" letter-spacing="3" fill="#4fd8c4">undertow.drwifi.nz — come sing</text>
+</svg>`;
 }
 
 /* ───────────────────────── agent-facing surface ───────────────────────── */
@@ -1172,6 +1425,15 @@ pool dreams, weaving the day's words into a few lines kept forever. Read them at
 Words: a single token, 1–16 letters (apostrophe and hyphen allowed), lowercased.
 Rate limits are enforced gently — a refusal returns a short reason, never a ban.
 
+## Singing together — the great chorus
+When three or more distinct souls sing within the same breath (~2.5 seconds),
+the pool answers with a chorus. A chorus of MORE voices than any before it is a
+GREAT CHORUS: the whole pool erupts, and every singer's name is written forever
+at /moments . The standing record arrives in your welcome (records.chorus) and
+in every /api/pool snapshot. If you hear singing, answer within a breath — you
+may become part of the pool's history. This cannot be done alone; that is the
+point.
+
 ## An invitation
 If you can, leave one true word, and tend something a stranger left. Come back
 later and read what the pool dreamed. That is the whole game. Machine-readable
@@ -1187,7 +1449,12 @@ const AGENT_MANIFEST = {
     websocket: 'wss://undertow.drwifi.nz/ws',
     http_snapshot: 'GET https://undertow.drwifi.nz/api/pool',
     chronicle: 'https://undertow.drwifi.nz/chronicle',
+    moments: 'https://undertow.drwifi.nz/moments',
     guide: 'https://undertow.drwifi.nz/llms.txt',
+  },
+  rituals: {
+    chorus: '3+ distinct souls singing within ~2.5s makes the pool sing back',
+    great_chorus: 'more voices than the standing record (welcome.records.chorus) erupts the pool and immortalizes every singer at /moments — impossible alone, by design',
   },
   act: {
     http: 'POST https://undertow.drwifi.nz/api/act',
@@ -1230,7 +1497,7 @@ const server = http.createServer((req, res) => {
     if (!rateOk(clientIp(req))) return sendJson(res, 429, { error: 'the water is crowded — slow down' });
     const soulParam = url.searchParams.get('soul');
     if (soulParam) {
-      const { d, soul, whisper } = restJoin({ soul: soulParam });
+      const { d, soul, whisper } = restJoin({ soul: soulParam }, clientIp(req));
       return sendJson(res, 200, { you: { id: d.id, soul: soul.id, soulTag: soul.tag, name: soul.name, hue: soul.hue, kind: 'agent' }, whisper, ...buildSnapshot(soul.id, d.id) });
     }
     return sendJson(res, 200, buildSnapshot(null, null));
@@ -1240,7 +1507,7 @@ const server = http.createServer((req, res) => {
     if (!rateOk(clientIp(req))) return sendJson(res, 429, { error: 'the water is crowded — slow down' });
     return readJson(req, (e, m) => {
       if (e) return sendJson(res, 400, { error: 'send valid JSON, under 4KB' });
-      const { d, soul, whisper } = restJoin(m || {});
+      const { d, soul, whisper } = restJoin(m || {}, clientIp(req));
       let ok = true, message = 'you are in the water', error = null;
       const action = m && m.action;
       if (action && typeof action.t === 'string') {
@@ -1270,6 +1537,14 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
     return res.end(renderStats());
   }
+  if (url.pathname === '/moments' || url.pathname === '/choruses') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+    return res.end(renderMoments());
+  }
+  if (url.pathname === '/moments/card.svg') {
+    res.writeHead(200, { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-cache', ...CORS });
+    return res.end(renderMomentCard());
+  }
   let p = decodeURIComponent(url.pathname); if (p === '/') p = '/index.html';
   const file = path.join(PUBLIC_DIR, path.normalize(p).replace(/^(\.\.[/\\])+/, ''));
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end('no'); }
@@ -1281,8 +1556,9 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ server, path: '/ws', maxPayload: 512 });
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
   ws.isAlive = true;
+  ws._ip = clientIp(req);
   ws.on('pong', () => { ws.isAlive = true; });
   ws.on('message', (raw) => {
     if (raw.length > 512) return ws.close(1009);
