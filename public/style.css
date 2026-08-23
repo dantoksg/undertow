@@ -358,12 +358,13 @@ body.awake #dock { opacity: 1; }
   text-transform: lowercase;
 }
 #corner-nav a {
-  color: rgba(127, 156, 155, .7);
+  color: rgba(160, 190, 188, .82);
   text-decoration: none;
   transition: color .3s;
   white-space: nowrap;
+  text-shadow: 0 0 12px rgba(4, 7, 13, .9), 0 0 4px rgba(4, 7, 13, .9);
 }
-#corner-nav a::after { content: " →"; opacity: .6; }
+#corner-nav a::after { content: " →"; opacity: .55; }
 #corner-nav a:hover, #corner-nav a:focus-visible { color: var(--glow); outline: none; }
 
 @media (max-width: 640px) {
@@ -387,11 +388,11 @@ body.awake #dock { opacity: 1; }
     right: auto;
     left: 50%;
     transform: translateX(-50%);
-    bottom: calc(max(14px, env(safe-area-inset-bottom)) + 84px);
+    bottom: calc(max(14px, env(safe-area-inset-bottom)) + 88px);
     flex-direction: row;
     align-items: center;
     gap: 1.4em;
-    font-size: .58rem;
+    font-size: .64rem;
     letter-spacing: .1em;
   }
 
