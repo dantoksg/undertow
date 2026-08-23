@@ -27,6 +27,6 @@ EXPOSE 3000
 
 # Node-based health probe (no curl dependency); Coolify may override with its own.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=8s --retries=5 \
-  CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+  CMD node -e "if((process.env.UNDERTOW_ROLE||'')==='keeper')process.exit(0);fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-CMD ["node", "server/server.js"]
+CMD ["node", "server/launch.js"]
