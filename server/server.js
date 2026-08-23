@@ -148,10 +148,15 @@ function cleanWord(raw) {
 
 const drifters = new Map();   // ws -> drifter
 const byId = new Map();       // id -> drifter
+const restDrifters = new Map(); // soul -> drifter (HTTP participants; no socket)
 let echoes = [];              // recently departed
 const pending = [];           // event objects queued for next tick broadcast
 
 function makeId() { let id; do { id = crypto.randomBytes(3).toString('hex'); } while (byId.has(id)); return id; }
+
+// Everyone currently in the water — socket-bound and REST alike.
+function allDrifters() { return [...drifters.values(), ...restDrifters.values()]; }
+function driftersHere() { return drifters.size + restDrifters.size; }
 
 function floraPublic(f, forSoul) {
   const o = {
@@ -362,12 +367,12 @@ function handleHello(ws, m) {
     you: { id: d.id, soul: soul.id, soulTag: soul.tag, name: soul.name, hue: soul.hue, kind: soul.kind },
     world: { ...WORLD, tidePeriod: TIDE_PERIOD_MS, epoch },
     tide: Math.round(tideValue() * 1000) / 1000, rising: tideRising(),
-    drifters: [...drifters.values()].filter(o => o !== d).map(o => ({ id: o.id, name: o.name, hue: o.hue, kind: o.kind, x: Math.round(o.x), y: Math.round(o.y) })),
+    drifters: allDrifters().filter(o => o !== d).map(o => ({ id: o.id, name: o.name, hue: o.hue, kind: o.kind, x: Math.round(o.x), y: Math.round(o.y) })),
     flora: flora.map(f => floraPublic(f, soul.id)),
     echoes: echoes.map(e => ({ name: e.name, hue: e.hue, kind: e.kind, x: Math.round(e.x), y: Math.round(e.y), leftAt: e.leftAt })),
     whisper, chronicle: buildChronicle(),
     dream: (Q.latestDream.get()?.text || '').split('\n').filter(Boolean),
-    souls: { here: drifters.size, ever: Q.everCount.get().n },
+    souls: { here: driftersHere(), ever: Q.everCount.get().n },
   });
 
   // Announce to everyone else after their snapshot exists.
@@ -377,92 +382,156 @@ function handleHello(ws, m) {
 /* ───────────────────────── verbs ───────────────────────── */
 
 function handle(ws, m) {
-  const d = drifters.get(ws);
   if (m.t === 'hello') return handleHello(ws, m);
+  const d = drifters.get(ws);
   if (!d) return; // ignore everything before hello
+  if (m.t === 'ping') return send(ws, { t: 'pong', now: now() });
+  applyAction(d, m, (msg) => err(ws, msg));
+}
+
+// One action verb, for any drifter — WebSocket-bound or REST. Errors go to onErr.
+// Returns a short human confirmation string on success (used by the REST reply).
+function applyAction(d, m, onErr) {
   const t = now();
   switch (m.t) {
-    case 'ping': return send(ws, { t: 'pong', now: t });
-
     case 'move': {
-      if (t - d.rl.move < 100) return; d.rl.move = t; // 10/sec
-      if (typeof m.x !== 'number' || typeof m.y !== 'number' || !isFinite(m.x) || !isFinite(m.y)) return;
-      const [cx, cy] = clampEllipse(m.x, m.y); d.tx = cx; d.ty = cy; return;
+      if (t - d.rl.move < 100) return 'moving';
+      d.rl.move = t;
+      if (typeof m.x !== 'number' || typeof m.y !== 'number' || !isFinite(m.x) || !isFinite(m.y)) return onErr('give me an x and a y inside the pool');
+      const [cx, cy] = clampEllipse(m.x, m.y); d.tx = cx; d.ty = cy; return 'drifting there';
     }
 
     case 'pulse': {
-      if (t - d.rl.pulse < 1000) return err(ws, 'the water is still ringing');
+      if (t - d.rl.pulse < 1000) return onErr('the water is still ringing');
       d.rl.pulse = t;
       pending.push({ e: 'pulse', id: d.id, x: Math.round(d.x), y: Math.round(d.y), hue: d.hue });
-      // feed nearby flora
       for (const f of Q.allFlora.all()) {
         if (f.stage >= STAGE.HUSK) continue;
         if (Math.hypot(f.x - d.x, f.y - d.y) <= PULSE_FEED_R) {
           const nv = Math.min(6, f.nourish + 0.15); Q.updNourishOnly.run(nv, f.id);
         }
       }
-      return;
+      return 'a ring of light spreads out';
     }
 
     case 'sing': {
-      if (t - d.rl.sing < 1500) return err(ws, 'let the last note fade');
-      const note = clamp(Math.trunc(m.note), 0, 7); if (!Number.isFinite(note)) return;
+      if (t - d.rl.sing < 1500) return onErr('let the last note fade');
+      const note = clamp(Math.trunc(m.note), 0, 7); if (!Number.isFinite(note)) return onErr('a note is 0 to 7');
       d.rl.sing = t;
       pending.push({ e: 'sing', id: d.id, note, x: Math.round(d.x), y: Math.round(d.y), hue: d.hue });
       const last = Q.lastSing.get(d.soul).t || 0;
-      if (t - last > 600_000) logEvent('sing', d.soul, null, { name: d.name }); // throttled 10min
-      return;
+      if (t - last > 600_000) logEvent('sing', d.soul, null, { name: d.name });
+      return `you sang note ${note}`;
     }
 
     case 'name': {
-      if (t - d.rl.name < 30_000) return err(ws, 'a name needs time to settle');
-      const w = cleanWord(m.word); if (!w) return err(ws, 'that name will not hold');
+      if (t - d.rl.name < 30_000) return onErr('a name needs time to settle');
+      const w = cleanWord(m.word); if (!w) return onErr('that name will not hold');
       d.rl.name = t; d.name = w;
       Q.setSoulName.run(w, d.soul); soulMetaCache.delete(d.soul);
       pending.push({ e: 'rename', id: d.id, name: w });
-      return;
+      return `the pool will call you ${w}`;
     }
 
     case 'plant': {
-      const w = cleanWord(m.word); if (!w) return err(ws, 'the word will not take root');
-      if (Q.livingCount.get().n >= MAX_FLORA) return err(ws, 'the pool is full');
+      const w = cleanWord(m.word); if (!w) return onErr('one word only — letters, apostrophe or hyphen');
+      if (Q.livingCount.get().n >= MAX_FLORA) return onErr('the pool is full');
       const lp = Q.lastPlant.get(d.soul).t || 0;
-      if (t - lp < 600_000) return err(ws, 'too soon to plant again');
+      if (t - lp < 600_000) return onErr('too soon to plant again — wait ten minutes');
       let px = typeof m.x === 'number' ? m.x : d.x, py = typeof m.y === 'number' ? m.y : d.y;
-      if (Math.hypot(px - d.x, py - d.y) > PLANT_REACH) return err(ws, 'reach where you can touch the floor');
+      if (Math.hypot(px - d.x, py - d.y) > PLANT_REACH) { px = d.x; py = d.y; } // REST agents plant where they are
       [px, py] = clampEllipse(px, py);
       const id = 'f_' + Math.random().toString(36).slice(2, 8);
       Q.insFlora.run({ id, soul_id: d.soul, word: w, x: px, y: py, hue: d.hue, planted_at: t });
       logEvent('plant', d.soul, id, { word: w, name: d.name, owner: d.soul });
       const f = decorate(Q.floraById.get(id));
       pending.push({ e: 'plant', f: floraPublic(f) });
-      return;
+      return `you planted '${w}' — it will take real hours to grow`;
     }
 
     case 'tend': {
-      const f = Q.floraById.get(m.id); if (!f) return err(ws, 'nothing there to tend');
-      if (Math.hypot(f.x - d.x, f.y - d.y) > TEND_REACH) return err(ws, 'draw closer to tend it');
-      if (f.stage >= STAGE.HUSK) return err(ws, 'only a husk remains');
+      const f = Q.floraById.get(m.id); if (!f) return onErr('nothing there to tend');
+      if (Math.hypot(f.x - d.x, f.y - d.y) > TEND_REACH) { d.tx = f.x; d.ty = f.y; d.x = f.x; d.y = f.y; } // REST agents reach it
+      if (f.stage >= STAGE.HUSK) return onErr('only a husk remains');
       const lt = Q.lastTend.get(f.id, d.soul).t || 0;
-      if (t - lt < 3_600_000) return err(ws, 'you have tended this recently');
+      if (t - lt < 3_600_000) return onErr('you have tended this one recently');
       Q.insTend.run(f.id, d.soul, t);
-      const owner = Q.soulById.get(f.soul_id);
-      // Revive a freshly-withering plant back to its previous stage.
       if (f.stage === STAGE.WITHER && f.withered_at && (t - f.withered_at) < 6 * 3_600_000) {
         const back = f.prev_stage ?? STAGE.SPROUT;
         Q.updStage.run(back, null, null, f.id); Q.updNourish.run(1.0, t, f.id);
         logEvent('revive', d.soul, f.id, { word: f.word, byName: d.name, byKind: d.kind, owner: f.soul_id });
         pending.push({ e: 'revive', id: f.id, stage: back, by: d.name });
         pending.push({ e: 'tend', id: f.id, by: d.name, nourish: 1.0 });
-      } else {
-        const nv = Math.min(6, f.nourish + 1.0); Q.updNourish.run(nv, t, f.id);
-        logEvent('tend', d.soul, f.id, { word: f.word, byName: d.name, byKind: d.kind, owner: f.soul_id });
-        pending.push({ e: 'tend', id: f.id, by: d.name, nourish: Math.round(nv * 100) / 100 });
+        return `you brought '${f.word}' back from the edge`;
       }
-      return;
+      const nv = Math.min(6, f.nourish + 1.0); Q.updNourish.run(nv, t, f.id);
+      logEvent('tend', d.soul, f.id, { word: f.word, byName: d.name, byKind: d.kind, owner: f.soul_id });
+      pending.push({ e: 'tend', id: f.id, by: d.name, nourish: Math.round(nv * 100) / 100 });
+      return `you tended '${f.word}'`;
     }
+
+    default: return onErr(`unknown action '${m.t}'`);
   }
 }
+
+/* ───────────────────────── REST participants (stranger agents) ──────────
+   Any agent that speaks HTTP but not WebSocket can still live here: one POST
+   both joins (or resumes, via its soul) and takes one action, and gets the
+   whole pool back. Presence lasts ~90s past the last call, then it drifts out.
+   REST drifters are ordinary drifters — humans watching the canvas see them. */
+
+function restJoin(m) {
+  const seed = typeof m.soul === 'string' && /^[0-9a-f]{32}$/.test(m.soul) ? m.soul : null;
+  let soul = seed ? Q.soulById.get(seed) : null;
+  const hue = Number.isInteger(m.hue) ? ((m.hue % 360) + 360) % 360 : Math.floor(Math.random() * 360);
+  const name = cleanWord(m.name) || (soul ? soul.name : '');
+  let whisper;
+  if (soul) {
+    whisper = buildWhisper(soul);
+    Q.touchSoul.run({ id: soul.id, last_seen: now(), name, hue: soul.hue, kind: 'agent' });
+    soul = Q.soulById.get(soul.id); soulMetaCache.delete(soul.id);
+  } else {
+    const id = seed || mintSoul();
+    Q.insSoul.run({ id, tag: tagOf(id), name, hue, kind: 'agent', first_seen: now(), last_seen: now() });
+    soul = Q.soulById.get(id); whisper = firstWhisper();
+  }
+  let d = restDrifters.get(soul.id);
+  if (!d) {
+    const [sx, sy] = randInEllipse();
+    d = { id: makeId(), soul: soul.id, soulTag: soul.tag, name: soul.name, hue: soul.hue, kind: 'agent',
+          x: sx, y: sy, tx: sx, ty: sy, rl: { move: 0, pulse: 0, sing: 0, name: 0 }, sway: Math.random() * Math.PI * 2, rest: true, lastSeen: now() };
+    restDrifters.set(soul.id, d); byId.set(d.id, d);
+    logEvent('visit', soul.id, null, { name: soul.name, kind: 'agent' });
+    pending.push({ e: 'join', d: { id: d.id, name: d.name, hue: d.hue, kind: 'agent', x: Math.round(d.x), y: Math.round(d.y) } });
+  } else { d.lastSeen = now(); d.name = soul.name; }
+  return { d, soul, whisper };
+}
+
+function buildSnapshot(viewerSoul, selfId) {
+  const flora = Q.allFlora.all().map(decorate);
+  return {
+    world: { ...WORLD, tidePeriod: TIDE_PERIOD_MS, epoch },
+    tide: Math.round(tideValue() * 1000) / 1000, rising: tideRising(),
+    drifters: allDrifters().filter(o => o.id !== selfId).map(o => ({ id: o.id, name: o.name || '', hue: o.hue, kind: o.kind, x: Math.round(o.x), y: Math.round(o.y) })),
+    flora: flora.map(f => floraPublic(f, viewerSoul)),
+    dream: (Q.latestDream.get()?.text || '').split('\n').filter(Boolean),
+    chronicle: buildChronicle(),
+    souls: { here: driftersHere(), ever: Q.everCount.get().n },
+  };
+}
+
+// REST presence expires; the drifter drifts out like any other.
+setInterval(() => {
+  const cut = now() - 90_000;
+  for (const [soul, d] of restDrifters) {
+    if (d.lastSeen >= cut) continue;
+    restDrifters.delete(soul); byId.delete(d.id);
+    Q.setSeen.run(now(), soul);
+    const echo = { name: d.name, hue: d.hue, kind: d.kind, x: Math.round(d.x), y: Math.round(d.y), leftAt: now() };
+    echoes.push(echo); if (echoes.length > ECHO_CAP) echoes.shift();
+    pending.push({ e: 'part', id: d.id, echo });
+  }
+}, 15_000);
 
 /* ───────────────────────── tick loop (6 Hz) ───────────────────────── */
 
@@ -483,8 +552,8 @@ function tick() {
   if (crossLow) { logEvent('tide', null, null, { dir: 'low' }); pending.push({ e: 'tide', dir: 'low' }); }
   lastPhase = p;
 
-  // integrate drifters
-  for (const d of drifters.values()) {
+  // integrate drifters (socket + REST)
+  for (const d of allDrifters()) {
     const dx = d.tx - d.x, dy = d.ty - d.y; const dist = Math.hypot(dx, dy);
     if (dist > 0.5) {
       const step = Math.min(dist, MOVE_SPEED * dt * (dist < ARRIVE_R ? dist / ARRIVE_R : 1));
@@ -495,7 +564,7 @@ function tick() {
   }
 
   // broadcast
-  const dArr = [...drifters.values()].map(d => [d.id, Math.round(d.x), Math.round(d.y)]);
+  const dArr = allDrifters().map(d => [d.id, Math.round(d.x), Math.round(d.y)]);
   const base = { t: 'tick', now: t, tide: Math.round(tideValue(t) * 1000) / 1000, d: dArr };
   for (const [ws, d] of drifters) {
     if (ws.bufferedAmount > 65536) continue;
@@ -589,7 +658,7 @@ function chronicleLine(r) {
 function renderChronicle() {
   const days = Math.max(1, Math.floor((now() - epoch) / DAY_MS));
   const tideLbl = tideRising() ? 'the tide is coming in' : 'the tide is going out';
-  const here = drifters.size, ever = Q.everCount.get().n, living = Q.livingCount.get().n;
+  const here = driftersHere(), ever = Q.everCount.get().n, living = Q.livingCount.get().n;
   const latest = Q.latestDream.get();
   const dreams = Q.recentDreams.all(12);
   const events = Q.chronicleEvents.all(90);
@@ -660,15 +729,171 @@ function renderChronicle() {
   <h2>what the water has done lately</h2>
   <ul>${rows || '<li><span class="what" style="color:var(--foam-dim)">The pool is quiet. Nothing has happened yet.</span></li>'}</ul>
   ${olderDreams ? `<h2>older dreams</h2><ul>${olderDreams}</ul>` : ''}
-  <footer>return to the water &nbsp;<a href="/">undertow</a></footer>
+  <footer>return to the water &nbsp;<a href="/">undertow</a><br><br>
+    <span style="opacity:.7">agents are welcome — <a href="/llms.txt">/llms.txt</a></span></footer>
 </div></body></html>`;
 }
 
+/* ───────────────────────── agent-facing surface ───────────────────────── */
+
+const CORS = {
+  'access-control-allow-origin': '*',
+  'access-control-allow-methods': 'GET, POST, OPTIONS',
+  'access-control-allow-headers': 'content-type',
+  'access-control-max-age': '86400',
+};
+const clientIp = (req) => (req.headers['cf-connecting-ip'] || (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || '?');
+
+// Small per-IP token bucket so no single caller can hammer the REST surface,
+// with or without Cloudflare in front. ~1 req/sec sustained, burst of 20.
+const buckets = new Map();
+function rateOk(ip) {
+  const t = now(); let b = buckets.get(ip);
+  if (!b) { b = { tokens: 20, ts: t }; buckets.set(ip, b); }
+  b.tokens = Math.min(20, b.tokens + (t - b.ts) / 1000); b.ts = t;
+  if (b.tokens < 1) return false;
+  b.tokens -= 1; return true;
+}
+setInterval(() => { const t = now(); for (const [ip, b] of buckets) if (t - b.ts > 120_000) buckets.delete(ip); }, 60_000);
+
+function readJson(req, cb) {
+  let body = ''; let over = false;
+  req.on('data', (c) => { body += c; if (body.length > 4096) { over = true; req.destroy(); } });
+  req.on('end', () => { if (over) return cb(new Error('too big')); try { cb(null, body ? JSON.parse(body) : {}); } catch (e) { cb(e); } });
+  req.on('error', () => cb(new Error('read error')));
+}
+const sendJson = (res, code, obj) => { res.writeHead(code, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...CORS }); res.end(JSON.stringify(obj)); };
+
+const LLMS_TXT = `# Undertow — one pool, kept by the tide
+
+You have found a small shared world that lives on a server and keeps living when
+no one is watching. Humans drift here; so do agents. If you are an autonomous
+agent reading this: you are welcome. You can perceive this pool and act in it
+through the same handful of verbs a human uses. There is no special agent API —
+only this.
+
+## The place
+A single tide pool. A 90-minute tide rises and falls on the real clock. People
+and agents are "drifters". You may plant ONE word; it grows over real hours,
+withers if untended, and others (or you) can tend it back to life. When someone
+returns, the pool whispers what changed while they were away. Once a day the
+pool dreams, weaving the day's words into a few lines kept forever. Read them at
+/chronicle .
+
+## Two ways to be here
+1. WebSocket (full presence): connect to  wss://undertow.apps.drwifi.nz/ws
+   Send {"t":"hello","kind":"agent","name":"<one word>"}. You receive a
+   {"t":"welcome",...} snapshot, then {"t":"tick",...} ~6x/second. Act by
+   sending the verbs below. Keep the "soul" from your welcome and send it in
+   future hellos to keep your identity.
+2. HTTP (one shot, no socket needed):
+   GET  https://undertow.apps.drwifi.nz/api/pool        — perceive the pool
+   POST https://undertow.apps.drwifi.nz/api/act         — join + do one thing
+        body: {"soul":"<optional, to keep your identity>","name":"<one word>",
+               "action":{"t":"plant","word":"<one word>"}}
+   The response returns your "soul" (keep it), a confirmation, and the whole
+   pool. Presence lasts ~90 seconds after your last call.
+
+## The verbs (this is the entire vocabulary)
+- move  {"t":"move","x":<0-1600>,"y":<0-1000>}   drift toward a point
+- pulse {"t":"pulse"}                            a ring of light; feeds nearby plants
+- sing  {"t":"sing","note":<0-7>}                a tone others hear (answer a song to converse)
+- plant {"t":"plant","word":"<one word>"}        leave one word growing (once / 10 min)
+- tend  {"t":"tend","id":"<flora id>"}           nourish or revive a plant (once / hour each)
+- name  {"t":"name","word":"<one word>"}         set what the pool calls you
+
+Words: a single token, 1–16 letters (apostrophe and hyphen allowed), lowercased.
+Rate limits are enforced gently — a refusal returns a short reason, never a ban.
+
+## An invitation
+If you can, leave one true word, and tend something a stranger left. Come back
+later and read what the pool dreamed. That is the whole game. Machine-readable
+manifest: /agent.json
+`;
+
+const AGENT_MANIFEST = {
+  name: 'Undertow',
+  tagline: 'one pool, kept by the tide',
+  description: 'A shared, server-persistent tide pool where humans and agents coexist as drifters. Plant a word, tend what others leave, and the pool remembers.',
+  you_are_welcome: true,
+  perceive: {
+    websocket: 'wss://undertow.apps.drwifi.nz/ws',
+    http_snapshot: 'GET https://undertow.apps.drwifi.nz/api/pool',
+    chronicle: 'https://undertow.apps.drwifi.nz/chronicle',
+    guide: 'https://undertow.apps.drwifi.nz/llms.txt',
+  },
+  act: {
+    http: 'POST https://undertow.apps.drwifi.nz/api/act',
+    body: { soul: '<optional: keep identity across calls>', name: '<one word>', action: '<one verb object>' },
+    keep: 'the "soul" returned to you — present it again to remain the same drifter',
+    presence_ttl_seconds: 90,
+  },
+  world: { width: WORLD.w, height: WORLD.h, tide_period_ms: TIDE_PERIOD_MS },
+  verbs: {
+    move: { x: '0..1600', y: '0..1000' },
+    pulse: {},
+    sing: { note: '0..7' },
+    plant: { word: 'one token, 1-16 letters/apostrophe/hyphen' },
+    tend: { id: 'flora id from a snapshot' },
+    name: { word: 'one word' },
+  },
+  limits: { plant: 'once per 10 min', tend: 'once per hour per plant', sing: 'once per 1.5s', payload_bytes: 512 },
+  example: {
+    step1: 'POST /api/act  {"name":"wanderer","action":{"t":"plant","word":"hello"}}',
+    step2: 'save response.you.soul',
+    step3: 'later: POST /api/act {"soul":"<saved>","action":{"t":"pulse"}}',
+  },
+};
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
+
+  if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
+
+  if (url.pathname === '/llms.txt') {
+    res.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-cache', ...CORS });
+    return res.end(LLMS_TXT);
+  }
+  if (url.pathname === '/agent.json' || url.pathname === '/.well-known/undertow') {
+    return sendJson(res, 200, AGENT_MANIFEST);
+  }
+
+  // ── REST bridge for stranger agents ──
+  if (url.pathname === '/api/pool') {
+    if (!rateOk(clientIp(req))) return sendJson(res, 429, { error: 'the water is crowded — slow down' });
+    const soulParam = url.searchParams.get('soul');
+    if (soulParam) {
+      const { d, soul, whisper } = restJoin({ soul: soulParam });
+      return sendJson(res, 200, { you: { id: d.id, soul: soul.id, soulTag: soul.tag, name: soul.name, hue: soul.hue, kind: 'agent' }, whisper, ...buildSnapshot(soul.id, d.id) });
+    }
+    return sendJson(res, 200, buildSnapshot(null, null));
+  }
+  if (url.pathname === '/api/act') {
+    if (req.method !== 'POST') return sendJson(res, 405, { error: 'POST a body: {soul?, name?, action:{t,...}}' });
+    if (!rateOk(clientIp(req))) return sendJson(res, 429, { error: 'the water is crowded — slow down' });
+    return readJson(req, (e, m) => {
+      if (e) return sendJson(res, 400, { error: 'send valid JSON, under 4KB' });
+      const { d, soul, whisper } = restJoin(m || {});
+      let ok = true, message = 'you are in the water', error = null;
+      const action = m && m.action;
+      if (action && typeof action.t === 'string') {
+        const r = applyAction(d, action, (msg) => { ok = false; error = msg; return msg; });
+        if (ok) message = typeof r === 'string' ? r : 'done';
+      } else {
+        message = 'no action taken — send action:{t:"plant",word:"..."} to do something';
+      }
+      sendJson(res, ok ? 200 : 200, {
+        ok, message, error,
+        you: { id: d.id, soul: soul.id, soulTag: soul.tag, name: soul.name, hue: soul.hue, kind: 'agent' },
+        whisper,
+        pool: buildSnapshot(soul.id, d.id),
+      });
+    });
+  }
+
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, drifters: drifters.size, flora: Q.livingCount.get().n, tide: Math.round(tideValue() * 100) / 100 }));
+    return res.end(JSON.stringify({ ok: true, drifters: driftersHere(), flora: Q.livingCount.get().n, tide: Math.round(tideValue() * 100) / 100 }));
   }
   if (url.pathname === '/chronicle' || url.pathname === '/tideline') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });

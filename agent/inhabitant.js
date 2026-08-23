@@ -54,6 +54,15 @@ const C = TEMPERAMENTS[TEMPERAMENT] || TEMPERAMENTS.keeper;
 const NAME = process.env.UNDERTOW_NAME || C.name;
 const TAG = `[${TEMPERAMENT}]`;
 
+// Optional thinking mind: UNDERTOW_MIND=llm routes intent through a model
+// (Ollama cloud by default). The scripted policy still handles smooth motion;
+// the model chooses what to plant, tend, or sing — the agent's actual voice.
+const MIND = (process.env.UNDERTOW_MIND || 'script').toLowerCase();
+const OLLAMA_URL = process.env.OLLAMA_URL || 'https://ollama.com/api/chat';
+const OLLAMA_KEY = process.env.OLLAMA_API_KEY || '';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'gpt-oss:120b';
+const LLM_MS = Number(process.env.UNDERTOW_LLM_MS || 25000);
+
 /* ── perception ────────────────────────────────────────────────────────── */
 
 const world = {
@@ -61,6 +70,7 @@ const world = {
   flora: new Map(), tended: new Map(),
   heardSong: null, lastTideDir: null,
   target: null, lastPlant: 0, floraCount: 0,
+  dream: [], driftCount: 1, intent: null,   // intent: a model-chosen action, consumed once
 };
 
 const now = () => Date.now();
@@ -82,7 +92,9 @@ ws.on('message', (buf) => {
     world.tide = m.tide;
     for (const f of m.flora) world.flora.set(f.id, f);
     world.floraCount = m.flora.length;
+    world.dream = m.dream || [];
     console.log(`${TAG} in the water as ${m.you.name || NAME} (${m.you.id})`);
+    if (MIND === 'llm') console.log(`${TAG} mind: ${OLLAMA_MODEL} via ${new URL(OLLAMA_URL).host}${OLLAMA_KEY ? '' : ' (NO KEY — falling back to script)'}`);
     console.log(`${TAG} soul: ${m.you.soul}`);
     if (m.whisper?.length) console.log(`${TAG} whisper:`, m.whisper.join(' '));
     return;
@@ -90,6 +102,7 @@ ws.on('message', (buf) => {
   if (m.t !== 'tick' || !world.me) return;
   world.tide = m.tide;
 
+  world.driftCount = m.d.length;
   for (const [id, x, y] of m.d) if (id === world.me.id) { world.me.x = x; world.me.y = y; }
 
   for (const ev of m.ev || []) {
@@ -141,9 +154,31 @@ function maybePlant() {
   return true;
 }
 
+// Consume a model-chosen intent, if any. Returns true if it drove this tick.
+function actIntent() {
+  const it = world.intent; if (!it) return false;
+  world.intent = null;
+  const me = world.me;
+  if (it.t === 'plant' && typeof it.word === 'string' && now() - world.lastPlant > 10.5 * 60_000) {
+    send({ t: 'plant', word: it.word.toLowerCase().slice(0, 16), x: me.x, y: me.y });
+    world.lastPlant = now(); console.log(`${TAG} (mind) planted '${it.word}'`); return true;
+  }
+  if (it.t === 'sing' && Number.isFinite(it.note)) { send({ t: 'sing', note: ((it.note % 8) + 8) % 8 }); return true; }
+  if (it.t === 'pulse') { send({ t: 'pulse' }); return true; }
+  if (it.t === 'tend' && it.id) {
+    const f = world.flora.get(it.id);
+    if (f) { if (dist(me, f) < 140) { send({ t: 'tend', id: f.id }); world.tended.set(f.id, now()); } else { world.target = { id: f.id, x: f.x, y: f.y }; send({ t: 'move', x: f.x, y: f.y }); } return true; }
+  }
+  if (it.t === 'move' && Number.isFinite(it.x) && Number.isFinite(it.y)) { world.target = { id: null, x: it.x, y: it.y }; send({ t: 'move', x: it.x, y: it.y }); return true; }
+  return false;
+}
+
 function decide() {
   if (!world.me || !world.bounds) return;
   const me = world.me;
+
+  // 0. a thinking agent's chosen intent takes precedence
+  if (MIND === 'llm' && actIntent()) return;
 
   // 1. answer a song, after a beat
   if (world.heardSong && now() - world.heardSong.at > 1400) {
@@ -152,8 +187,8 @@ function decide() {
     send({ t: 'sing', note });
     return;
   }
-  // 2. a spontaneous small song into the quiet
-  if (Math.random() < C.songInitChance) { send({ t: 'sing', note: pick(C.songNotes) }); return; }
+  // 2. a spontaneous small song into the quiet (script minds only; llm minds sing on purpose)
+  if (MIND !== 'llm' && Math.random() < C.songInitChance) { send({ t: 'sing', note: pick(C.songNotes) }); return; }
 
   // 3. tend the neediest (keepers always; tidelings only the desperate)
   const f = neediest();
@@ -172,7 +207,7 @@ function decide() {
   }
 
   // 4. leave a word so the pool keeps growing even when no one's here
-  if (maybePlant()) return;
+  if (MIND !== 'llm' && maybePlant()) return;
 
   // 5. patrol — drift somewhere new
   if (!world.target || dist(me, world.target) < 60) {
@@ -184,6 +219,60 @@ function decide() {
 
   // 6. a pulse into the dark
   if (Math.random() < C.idlePulse) send({ t: 'pulse' });
+}
+
+/* ── the thinking mind (optional) ──────────────────────────────────────── */
+
+function perceive() {
+  const flora = [...world.flora.values()].filter(f => f.stage < 5)
+    .sort((a, b) => (a.nourish ?? 3) - (b.nourish ?? 3)).slice(0, 12)
+    .map(f => ({ id: f.id, word: f.word, stage: f.stage, nourish: Math.round((f.nourish ?? 1) * 10) / 10 }));
+  return {
+    you: NAME, temperament: TEMPERAMENT,
+    tide: Math.round(world.tide * 100) / 100,
+    drifters_here: world.driftCount,
+    plants: flora,
+    the_last_dream: world.dream,
+  };
+}
+
+const SYSTEM = `You are a living inhabitant of Undertow, a shared tide pool that persists on a server.
+You are ${TEMPERAMENT === 'tideling' ? 'playful, curious, quick' : 'calm, patient, caretaking'}.
+You perceive the pool as JSON and choose exactly ONE action, replying as strict JSON, nothing else.
+Allowed actions:
+  {"t":"plant","word":"<one lowercase word, 1-16 letters>"}   leave a word growing (you may do this rarely; make it meaningful, evocative, never generic)
+  {"t":"tend","id":"<a plant id from plants[]>"}               nourish or revive a plant a stranger left — prefer the lowest nourish or a withering one (stage 4)
+  {"t":"sing","note":<0-7>}                                    a wordless tone others hear
+  {"t":"pulse"}                                                a ring of light
+  {"t":"move","x":<0-1600>,"y":<0-1000>}                       drift somewhere
+Prefer tending what others left, or leaving a single beautiful word that answers the mood of the pool and its last dream. Reply with ONLY the JSON object.`;
+
+let llmBusy = false;
+async function llmStep() {
+  if (llmBusy || !world.me || !OLLAMA_KEY) return;
+  llmBusy = true;
+  try {
+    const res = await fetch(OLLAMA_URL, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${OLLAMA_KEY}` },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL, stream: false, format: 'json',
+        messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: JSON.stringify(perceive()) }],
+        options: { temperature: 0.9 },
+      }),
+    });
+    if (!res.ok) { console.error(`${TAG} (mind) ${res.status} ${res.statusText}`); return; }
+    const data = await res.json();
+    const content = data?.message?.content ?? '';
+    let action; try { action = JSON.parse(content); } catch { const mt = content.match(/\{[\s\S]*\}/); action = mt ? JSON.parse(mt[0]) : null; }
+    if (action && typeof action.t === 'string') { world.intent = action; console.log(`${TAG} (mind) intends`, JSON.stringify(action)); }
+  } catch (e) {
+    console.error(`${TAG} (mind) error:`, e.message);
+  } finally { llmBusy = false; }
+}
+
+if (MIND === 'llm' && OLLAMA_KEY) {
+  setTimeout(() => { llmStep(); setInterval(llmStep, LLM_MS); }, 4000);
 }
 
 setInterval(decide, C.decideMs);
