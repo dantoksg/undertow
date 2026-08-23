@@ -95,7 +95,7 @@ ws.on('message', (buf) => {
     world.floraCount = m.flora.length;
     world.dream = m.dream || [];
     console.log(`${TAG} in the water as ${m.you.name || NAME} (${m.you.id})`);
-    if (MIND === 'llm') console.log(`${TAG} mind: ${OLLAMA_MODEL} via ${new URL(OLLAMA_URL).host}${OLLAMA_KEY ? '' : ' (NO KEY — falling back to script)'}`);
+    if (MIND === 'llm') console.log(`${TAG} mind: ${OLLAMA_MODEL} at ${OLLAMA_URL}${OLLAMA_KEY ? '' : ' (NO KEY — falling back to script)'}`);
     console.log(`${TAG} soul: ${m.you.soul}`);
     if (m.whisper?.length) console.log(`${TAG} whisper:`, m.whisper.join(' '));
     return;
