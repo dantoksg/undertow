@@ -59,6 +59,9 @@ const S = {
   hintsSeen: { move: false, pulse: false },
   lastPulseAt: 0,
   lastSingAt: 0,
+  dreamLines: [],                   // last night's dream, murmured by the water
+  dreamIx: 0,
+  nextDreamAt: 0,
 };
 
 /* ── dom ───────────────────────────────────────────────────────────────── */
@@ -353,6 +356,11 @@ function onWelcome(m) {
   for (const e of m.echoes || []) S.echoes.push({ ...e });
   S.soulsEver = m.souls?.ever ?? null;
 
+  // keep last night's dream — the water will murmur it, a line at a time
+  S.dreamLines = (m.dream || []).filter(Boolean);
+  S.dreamIx = 0;
+  S.nextDreamAt = 0;
+
   spawnMotes();
   showWhisper(m.whisper || []);
   maybeAskName(m.you);
@@ -388,7 +396,10 @@ function onEvent(ev) {
       if (!mine) { spawnPulse(ev.x, ev.y, ev.hue); playPulse(ev.x, true); }
       break;
     case 'sing':
-      if (!mine) { spawnSong(ev.x, ev.y, ev.note, ev.hue); playNote(ev.note, ev.x, true); }
+      if (!mine) {
+        spawnSong(ev.x, ev.y, ev.note, ev.hue); playNote(ev.note, ev.x, true);
+        noteSing(ev.id, ev.x, ev.y, ev.hue);
+      }
       break;
     case 'join':
       if (ev.d && (!S.me || ev.d.id !== S.me.id)) {
@@ -465,6 +476,9 @@ function startSimulacrum() {
     S.me = { id: 'me', soulTag: null, name: '', hue: 170, kind: 'visitor',
              x: 800, y: 700, tx: 800, ty: 700, trail: [] };
   }
+  // even the memory of the pool murmurs — a single borrowed dream-line
+  S.dreamLines = ['somewhere, the real pool is still breathing.'];
+  S.dreamIx = 0; S.nextDreamAt = 0;
   const ghosts = [
     { id: '~fern', name: 'fern', hue: 120, kind: 'visitor', x: 600, y: 380 },
     { id: '~moss', name: 'moss', hue: 275, kind: 'agent', x: 1050, y: 520 },
@@ -501,6 +515,7 @@ function simStep() {
     if (Math.random() < 0.06) {
       const n = Math.floor(Math.random() * 8);
       spawnSong(d.x, d.y, n, d.hue); playNote(n, d.x, true);
+      noteSing(d.id, d.x, d.y, d.hue);
     }
   }
 }
@@ -574,6 +589,87 @@ function spawnBloom(x, y, hue) {
   });
 }
 
+/* ── song threads ──────────────────────────────────────────────────────────
+   "answer a song to converse", the invitation says — so an answered song
+   should look like an answer. When one drifter sings within a breath of
+   another, a filament of light joins the two singers for a moment.        */
+
+const recentSings = [];              // { id, x, y, hue, at }
+
+function noteSing(id, x, y, hue) {
+  const t = performance.now();
+  for (const s of recentSings) {
+    if (s.id !== id && t - s.at < 6000) spawnThread(s.x, s.y, s.hue, x, y, hue);
+  }
+  const i = recentSings.findIndex((s) => s.id === id);
+  if (i >= 0) recentSings.splice(i, 1);
+  recentSings.push({ id, x, y, hue, at: t });
+  while (recentSings.length && (recentSings.length > 12 || t - recentSings[0].at > 12000)) {
+    recentSings.shift();
+  }
+}
+
+function spawnThread(x1, y1, hue1, x2, y2, hue2) {
+  S.effects.push({
+    kind: 'thread', x: x1, y: y1, x2, y2, hue: hue1, hue2,
+    t0: performance.now(), life: REDUCED_MOTION ? 2400 : 3400,
+  });
+  exciteMotes((x1 + x2) / 2, (y1 + y2) / 2, 0.3);
+}
+
+/* ── bioluminescent wake ───────────────────────────────────────────────────
+   The pool's namesake: disturbed water glows. Anything that swims — you,
+   a stranger, a keeper — parts the plankton and leaves a stirred shimmer. */
+
+function wake(d) {
+  const sp = Math.hypot(d.vx || 0, d.vy || 0);
+  if (sp < 34) return;                               // idle sway doesn't stir
+  const t = performance.now();
+  if (d.lastWake && t - d.lastWake < (LOW_POWER ? 170 : 90)) return;
+  d.lastWake = t;
+  let power = clamp(sp / DRIFT_SPEED, 0, 1);
+  if (REDUCED_MOTION) power *= 0.5;
+  for (const m of S.motes) {
+    const dd = dist(m.x, m.y, d.x, d.y);
+    if (dd < 90 && dd > 1) {
+      const f = (1 - dd / 90) * power;
+      // push outward, so the water parts around the swimmer and lights up
+      m.vx += ((m.x - d.x) / dd) * f * 34;
+      m.vy += ((m.y - d.y) / dd) * f * 34;
+    }
+  }
+}
+
+/* ── the dream, murmured ───────────────────────────────────────────────────
+   Each night the pool weaves the day's words into a dream, kept forever.
+   It shouldn't live only on /chronicle: every so often a line of it
+   surfaces in the deep water, drifts, and dissolves.                      */
+
+function splitDreamLine(text) {
+  if (text.length <= 44) return [text];
+  const mid = Math.floor(text.length / 2);
+  let cut = text.lastIndexOf(' ', mid);
+  if (cut < 12) cut = text.indexOf(' ', mid);
+  if (cut < 0) return [text];
+  return [text.slice(0, cut), text.slice(cut + 1)];
+}
+
+function maybeSurfaceDream(pn) {
+  if (!S.dreamLines.length) return;
+  if (!S.nextDreamAt) { S.nextDreamAt = pn + 45000 + Math.random() * 30000; return; }
+  if (pn < S.nextDreamAt) return;
+  S.nextDreamAt = pn + 150000 + Math.random() * 120000;   // every 2.5–4.5 min
+  const text = S.dreamLines[S.dreamIx % S.dreamLines.length];
+  S.dreamIx += 1;
+  const w = S.world;
+  const x = w.cx + (Math.random() - 0.5) * w.rx * 0.55;
+  const y = w.cy - w.ry * (0.05 + Math.random() * 0.3);
+  S.effects.push({
+    kind: 'dream', x, y, lines: splitDreamLine(text),
+    t0: pn, life: REDUCED_MOTION ? 12000 : 16000,
+  });
+}
+
 /* ── actions ───────────────────────────────────────────────────────────── */
 
 function actMove(wx, wy) {
@@ -600,6 +696,7 @@ function actSing(note) {
   S.lastSingAt = now;
   spawnSong(S.me.x, S.me.y, note, S.me.hue);
   playNote(note, S.me.x, false);
+  noteSing(S.me.id, S.me.x, S.me.y, S.me.hue);
   send({ t: 'sing', note });
 }
 
@@ -865,8 +962,11 @@ function stepLocal(dt) {
 
   // others: interpolate toward server pos
   for (const d of S.drifters.values()) {
+    const px = d.x, py = d.y;
     d.x = lerp(d.x, d.tx, 1 - Math.pow(0.0018, dt));
     d.y = lerp(d.y, d.ty, 1 - Math.pow(0.0018, dt));
+    if (dt > 0) { d.vx = (d.x - px) / dt; d.vy = (d.y - py) / dt; }
+    wake(d);
     pushTrail(d);
   }
 
@@ -925,6 +1025,7 @@ function stepDrifter(d, dt, curDx, isMe) {
   }
   d.x += curDx * 0.3;
   [d.x, d.y] = clampToPool(d.x, d.y);
+  wake(d);
   pushTrail(d);
 }
 
@@ -1286,6 +1387,43 @@ function drawEffects(pn) {
           ctx.beginPath(); ctx.arc(sx, sy, sp.sz * cam.s, 0, TAU); ctx.fill();
         }
       }
+    } else if (e.kind === 'thread') {
+      // an answered song: a filament of light between the two singers
+      const a = Math.sin(Math.PI * k) * 0.4;             // swell in, let go
+      const x2 = w2sX(e.x2), y2 = w2sY(e.y2);
+      const mx = (x + x2) / 2, my = (y + y2) / 2 - 40 * cam.s;
+      const grad = ctx.createLinearGradient(x, y, x2, y2);
+      grad.addColorStop(0, `hsla(${e.hue}, 80%, 70%, ${a})`);
+      grad.addColorStop(1, `hsla(${e.hue2}, 80%, 70%, ${a})`);
+      ctx.strokeStyle = grad;
+      ctx.lineWidth = Math.max(1, 1.6 * cam.s);
+      ctx.lineCap = 'round';
+      ctx.beginPath(); ctx.moveTo(x, y); ctx.quadraticCurveTo(mx, my, x2, y2); ctx.stroke();
+      if (!REDUCED_MOTION) {
+        // a spark travels from the first singer to the one who answered
+        const qx = (1 - k) * (1 - k) * x + 2 * (1 - k) * k * mx + k * k * x2;
+        const qy = (1 - k) * (1 - k) * y + 2 * (1 - k) * k * my + k * k * y2;
+        ctx.fillStyle = `hsla(${e.hue2}, 90%, 80%, ${0.8 * (1 - k)})`;
+        ctx.beginPath(); ctx.arc(qx, qy, 2.4 * cam.s, 0, TAU); ctx.fill();
+      }
+    } else if (e.kind === 'dream') {
+      // the pool murmurs last night's dream — a line surfaces, then dissolves
+      const a = Math.sin(Math.PI * k) * 0.34;
+      if (a > 0.01) {
+        const rise = REDUCED_MOTION ? 0 : k * 26 * cam.s;
+        const swayX = REDUCED_MOTION ? 0 : Math.sin(pn * 0.0004 + e.t0) * 8 * cam.s;
+        const fpx = Math.max(11, 13.5 * cam.s);
+        ctx.font = `italic ${fpx}px "Iowan Old Style", Palatino, Georgia, serif`;
+        ctx.textAlign = 'center';
+        ctx.fillStyle = `hsla(258, 50%, 82%, ${a})`;
+        ctx.shadowColor = 'hsla(258, 80%, 70%, 0.5)';
+        ctx.shadowBlur = 12;
+        e.lines.forEach((line, i) => {
+          ctx.fillText(line, x + swayX, y - rise + i * fpx * 1.6);
+        });
+        ctx.shadowBlur = 0;
+        ctx.textAlign = 'left';
+      }
     }
   }
   ctx.restore();
@@ -1387,6 +1525,7 @@ function frame(pn) {
 
   if (S.sim) S.tide = tideNow().tide;
   stepLocal(dt);
+  maybeSurfaceDream(pn);
   draw(pn);
 
   if (pn - hudAt > 3000) { hudAt = pn; updateHud(); audioTide(S.tide); }
