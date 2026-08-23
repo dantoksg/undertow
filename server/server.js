@@ -62,6 +62,13 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_at ON events(at);
 CREATE TABLE IF NOT EXISTS world (k TEXT PRIMARY KEY, v TEXT);
+CREATE TABLE IF NOT EXISTS dreams (
+  id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  at   INTEGER NOT NULL,
+  day  INTEGER NOT NULL,          -- UTC day number the dream is of
+  text TEXT NOT NULL              -- the dream, newline-separated lines
+);
+CREATE INDEX IF NOT EXISTS idx_dreams_day ON dreams(day);
 `);
 
 // Prune ancient events on boot.
@@ -95,6 +102,14 @@ const Q = {
   eventsSince: db.prepare(`SELECT * FROM events WHERE at > ? ORDER BY at ASC`),
   recentEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither') ORDER BY at DESC LIMIT ?`),
   lastSing: db.prepare(`SELECT MAX(at) t FROM events WHERE type='sing' AND soul_id=?`),
+  eventsBetween: db.prepare(`SELECT * FROM events WHERE at >= ? AND at < ? ORDER BY at ASC`),
+  chronicleEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither','husk','dream') ORDER BY at DESC LIMIT ?`),
+  insDream: db.prepare(`INSERT INTO dreams(at,day,text) VALUES(?,?,?)`),
+  latestDream: db.prepare(`SELECT * FROM dreams ORDER BY day DESC LIMIT 1`),
+  lastDreamDay: db.prepare(`SELECT MAX(day) d FROM dreams`),
+  dreamForDay: db.prepare(`SELECT id FROM dreams WHERE day = ?`),
+  recentDreams: db.prepare(`SELECT * FROM dreams ORDER BY day DESC LIMIT ?`),
+  distinctSoulsBetween: db.prepare(`SELECT COUNT(DISTINCT soul_id) n FROM events WHERE type='visit' AND at >= ? AND at < ?`),
 };
 
 const logEvent = (type, soul_id, subject, data) =>
@@ -224,6 +239,83 @@ function buildChronicle() {
   return out.slice(0, 5);
 }
 
+/* ───────────────────────── the pool dreams ─────────────────────────────
+   Once a day the pool takes the words planted that day and the day's small
+   fates, and launders them into a short dream — the way sleep turns the day's
+   residue into something stranger. Kept forever. No model, just the pool's
+   own memory folded over on itself. Surfaced on arrival and on /chronicle. */
+
+const DAY_MS = 86_400_000;
+const dayNumber = (t = now()) => Math.floor(t / DAY_MS);
+const pickOf = (a) => a[Math.floor(Math.random() * a.length)];
+
+function composeDream(day) {
+  const start = day * DAY_MS, end = start + DAY_MS;
+  const rows = Q.eventsBetween.all(start, Math.min(end, now() + 1));
+  const words = [], blooms = [], withers = [], revives = [];
+  let tides = 0, byAgent = false;
+  for (const r of rows) {
+    let d = {}; try { d = r.data ? JSON.parse(r.data) : {}; } catch {}
+    if (r.type === 'plant') { words.push(d.word); }
+    else if (r.type === 'grow' && d.stage >= STAGE.BLOOM) blooms.push(d.word);
+    else if (r.type === 'wither') withers.push(d.word);
+    else if (r.type === 'revive') revives.push(d.word);
+    else if (r.type === 'tide') tides++;
+    else if (r.type === 'visit' && d.kind === 'agent') byAgent = true;
+  }
+  const uniq = [...new Set(words.filter(Boolean))];
+  const souls = Q.distinctSoulsBetween.get(start, Math.min(end, now() + 1)).n;
+
+  if (!uniq.length && !tides && !souls) return 'The pool dreamed of no one, and kept your place.';
+
+  const lines = [];
+  lines.push(tides > 0
+    ? `The tide turned ${tides} ${tides === 1 ? 'time' : 'times'} while it slept.`
+    : 'The water lay still, and still it dreamed.');
+
+  if (uniq.length >= 3) {
+    const [a, b, c] = shuffle(uniq).slice(0, 3);
+    lines.push(pickOf([
+      `'${a}' drifted into '${b}', and neither could say which came first.`,
+      `'${a}', '${b}', '${c}' — the pool turned them over like stones.`,
+      `It kept returning to '${a}', the way a tide returns to '${b}'.`,
+    ]));
+  } else if (uniq.length === 2) {
+    const [a, b] = shuffle(uniq);
+    lines.push(pickOf([
+      `Someone had left '${a}'. By morning it was tangled in '${b}'.`,
+      `'${a}' and '${b}' kept the same slow orbit all night.`,
+    ]));
+  } else if (uniq.length === 1) {
+    lines.push(`Only '${uniq[0]}' remained, and the pool held it close.`);
+  }
+
+  if (blooms.length) lines.push(`'${pickOf(blooms)}' opened in the dark.`);
+  else if (revives.length) lines.push(`'${pickOf(revives)}' had been almost lost; something stayed for it.`);
+  else if (withers.length) lines.push(`'${pickOf(withers)}' let go, and the pool remembered it anyway.`);
+  else if (souls && byAgent) lines.push(`Something that was not a person passed through, and tended the quiet.`);
+
+  return lines.slice(0, 3).join('\n');
+}
+
+function shuffle(a) { a = a.slice(); for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [a[i], a[j]] = [a[j], a[i]]; } return a; }
+
+function storeDream(day) {
+  if (Q.dreamForDay.get(day)) return null;
+  const text = composeDream(day);
+  Q.insDream.run(now(), day, text);
+  logEvent('dream', null, null, { line: text.split('\n')[0] });
+  console.log(`[pool] dreamed of day ${day}: ${text.split('\n')[0]}`);
+  return text;
+}
+
+function dreamTick() {
+  const today = dayNumber();
+  const last = Q.lastDreamDay.get().d;
+  if (last == null) storeDream(today);           // young pool: seed one now, visibly
+  else if (today > last) storeDream(today - 1);  // dream the day that just ended
+}
+
 /* ───────────────────────── connection / hello ───────────────────────── */
 
 function send(ws, obj) { if (ws.readyState === 1) { try { ws.send(JSON.stringify(obj)); } catch {} } }
@@ -274,6 +366,7 @@ function handleHello(ws, m) {
     flora: flora.map(f => floraPublic(f, soul.id)),
     echoes: echoes.map(e => ({ name: e.name, hue: e.hue, kind: e.kind, x: Math.round(e.x), y: Math.round(e.y), leftAt: e.leftAt })),
     whisper, chronicle: buildChronicle(),
+    dream: (Q.latestDream.get()?.text || '').split('\n').filter(Boolean),
     souls: { here: drifters.size, ever: Q.everCount.get().n },
   });
 
@@ -472,11 +565,114 @@ setInterval(() => { const cut = now() - ECHO_TTL_MS; echoes = echoes.filter(e =>
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.json': 'application/json', '.woff2': 'font/woff2' };
 
+const esc = (s) => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+function ago(ms) {
+  const s = Math.max(0, Math.floor((now() - ms) / 1000));
+  if (s < 60) return 'moments ago';
+  const m = Math.floor(s / 60); if (m < 60) return `${m} min ago`;
+  const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24); return `${d}d ago`;
+}
+function chronicleLine(r) {
+  let d = {}; try { d = r.data ? JSON.parse(r.data) : {}; } catch {}
+  switch (r.type) {
+    case 'tide': return d.dir === 'high' ? 'the tide rose to its full' : 'the tide drew down';
+    case 'plant': return `${esc(d.name || 'someone')} planted &lsquo;${esc(d.word)}&rsquo;`;
+    case 'grow': return d.stage >= STAGE.BLOOM ? `&lsquo;${esc(d.word)}&rsquo; came into bloom` : null;
+    case 'revive': return `&lsquo;${esc(d.word)}&rsquo; was brought back from the edge`;
+    case 'wither': return `&lsquo;${esc(d.word)}&rsquo; began to wither`;
+    case 'husk': return `&lsquo;${esc(d.word)}&rsquo; hardened to a husk`;
+    case 'dream': return `the pool dreamed`;
+    default: return null;
+  }
+}
+function renderChronicle() {
+  const days = Math.max(1, Math.floor((now() - epoch) / DAY_MS));
+  const tideLbl = tideRising() ? 'the tide is coming in' : 'the tide is going out';
+  const here = drifters.size, ever = Q.everCount.get().n, living = Q.livingCount.get().n;
+  const latest = Q.latestDream.get();
+  const dreams = Q.recentDreams.all(12);
+  const events = Q.chronicleEvents.all(90);
+
+  const dreamBlock = latest
+    ? `<section class="dream"><p class="eyebrow">the last dream</p>${latest.text.split('\n').map(l => `<p class="dreamline">${esc(l)}</p>`).join('')}</section>`
+    : '';
+
+  const rows = events.map(r => {
+    const line = chronicleLine(r); if (!line) return '';
+    return `<li><span class="when">${ago(r.at)}</span><span class="what">${line}</span></li>`;
+  }).filter(Boolean).join('');
+
+  const olderDreams = dreams.slice(1).map(dr =>
+    `<li class="pastdream"><span class="when">day ${dr.day % 1000}</span><span class="what">${esc(dr.text.split('\n')[0])}</span></li>`
+  ).join('');
+
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="90">
+<title>Tideline — the pool remembers</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;1,9..144,300&family=Space+Grotesk:wght@400;500&display=swap">
+<style>
+  :root{--abyss:#04070d;--ink:#0a1220;--foam:#cfe8e4;--foam-dim:#7f9c9b;--glow:#4fd8c4;--glow-2:#a78bfa;
+    --serif:"Fraunces",Georgia,serif;--sans:"Space Grotesk",-apple-system,system-ui,sans-serif;}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:radial-gradient(130% 100% at 50% -10%,#0a2540 0%,#071427 45%,var(--abyss) 100%);
+    background-color:var(--abyss);color:var(--foam);font-family:var(--sans);min-height:100vh;
+    -webkit-font-smoothing:antialiased;line-height:1.6;padding:clamp(2rem,6vw,5rem) 1.25rem;}
+  .wrap{max-width:38rem;margin:0 auto;}
+  header{text-align:center;margin-bottom:2.5rem;}
+  h1{font-family:var(--serif);font-weight:300;font-size:clamp(2rem,6vw,3rem);letter-spacing:.16em;
+    text-transform:lowercase;text-shadow:0 0 28px rgba(79,216,196,.35);}
+  .sub{color:var(--foam-dim);font-size:.78rem;letter-spacing:.2em;text-transform:lowercase;margin-top:.6rem;}
+  .state{display:flex;flex-wrap:wrap;justify-content:center;gap:.4rem 1.1rem;margin-top:1.1rem;
+    color:var(--foam-dim);font-size:.74rem;letter-spacing:.08em;}
+  .state b{color:var(--foam);font-weight:500;font-variant-numeric:tabular-nums;}
+  .dream{margin:2.5rem 0;padding:1.6rem 1.5rem;border:1px solid rgba(167,139,250,.22);border-radius:14px;
+    background:linear-gradient(160deg,rgba(167,139,250,.08),rgba(10,37,64,.35));text-align:center;}
+  .eyebrow{color:var(--glow-2);font-size:.62rem;letter-spacing:.28em;text-transform:uppercase;margin-bottom:.8rem;}
+  .dreamline{font-family:var(--serif);font-style:italic;font-weight:300;font-size:clamp(1.05rem,2.6vw,1.3rem);
+    color:var(--foam);text-shadow:0 0 20px rgba(167,139,250,.25);}
+  .dreamline + .dreamline{margin-top:.35rem;}
+  h2{font-family:var(--serif);font-weight:300;font-size:1.15rem;letter-spacing:.05em;
+    color:var(--foam);margin:2.4rem 0 1rem;opacity:.9;}
+  ul{list-style:none;}
+  li{display:flex;gap:1rem;align-items:baseline;padding:.5rem 0;border-bottom:1px solid rgba(127,156,155,.1);}
+  .when{flex:0 0 6.5rem;color:var(--foam-dim);font-size:.68rem;letter-spacing:.06em;text-align:right;
+    font-variant-numeric:tabular-nums;}
+  .what{flex:1;color:var(--foam);font-size:.92rem;}
+  .pastdream .what{font-family:var(--serif);font-style:italic;color:var(--foam-dim);}
+  footer{text-align:center;margin-top:3rem;color:var(--foam-dim);font-size:.72rem;letter-spacing:.1em;}
+  a{color:var(--glow);text-decoration:none;border-bottom:1px solid rgba(79,216,196,.3);}
+  a:hover{border-color:var(--glow);}
+</style></head><body><div class="wrap">
+  <header>
+    <h1>tideline</h1>
+    <p class="sub">the pool remembers</p>
+    <div class="state">
+      <span>${esc(tideLbl)}</span>
+      <span><b>${here}</b> adrift now</span>
+      <span><b>${ever}</b> have passed through</span>
+      <span><b>${living}</b> growing</span>
+      <span>breathing <b>${days}</b> ${days === 1 ? 'day' : 'days'}</span>
+    </div>
+  </header>
+  ${dreamBlock}
+  <h2>what the water has done lately</h2>
+  <ul>${rows || '<li><span class="what" style="color:var(--foam-dim)">The pool is quiet. Nothing has happened yet.</span></li>'}</ul>
+  ${olderDreams ? `<h2>older dreams</h2><ul>${olderDreams}</ul>` : ''}
+  <footer>return to the water &nbsp;<a href="/">undertow</a></footer>
+</div></body></html>`;
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     return res.end(JSON.stringify({ ok: true, drifters: drifters.size, flora: Q.livingCount.get().n, tide: Math.round(tideValue() * 100) / 100 }));
+  }
+  if (url.pathname === '/chronicle' || url.pathname === '/tideline') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+    return res.end(renderChronicle());
   }
   let p = decodeURIComponent(url.pathname); if (p === '/') p = '/index.html';
   const file = path.join(PUBLIC_DIR, path.normalize(p).replace(/^(\.\.[/\\])+/, ''));
@@ -512,8 +708,10 @@ setInterval(() => {
 
 setInterval(tick, TICK_MS);
 setInterval(growth, 60_000);
+setInterval(dreamTick, 5 * 60_000);   // the pool checks whether it's time to dream
 
 server.listen(PORT, () => {
   const days = Math.floor((now() - epoch) / 86_400_000);
+  dreamTick();   // seed the first dream so /chronicle has something to show
   console.log(`Undertow listening on :${PORT} — the pool has been breathing for ${days} day(s).`);
 });
