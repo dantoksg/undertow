@@ -231,7 +231,11 @@ function err(ws, msg) { send(ws, { t: 'err', msg }); }
 
 function handleHello(ws, m) {
   if (drifters.has(ws)) return; // already joined
-  let soul = typeof m.soul === 'string' && /^[0-9a-f]{32}$/.test(m.soul) ? Q.soulById.get(m.soul) : null;
+  // A valid 32-hex soul may be presented as a bearer identity. If known, it's a
+  // return; if well-formed but unknown, honor it as a seed (lets agents keep a
+  // fixed identity across restarts via UNDERTOW_SOUL). Otherwise mint fresh.
+  const seed = typeof m.soul === 'string' && /^[0-9a-f]{32}$/.test(m.soul) ? m.soul : null;
+  let soul = seed ? Q.soulById.get(seed) : null;
 
   const hue = Number.isInteger(m.hue) ? ((m.hue % 360) + 360) % 360 : Math.floor(Math.random() * 360);
   const kind = m.kind === 'agent' ? 'agent' : 'visitor';
@@ -244,7 +248,7 @@ function handleHello(ws, m) {
     soul = Q.soulById.get(soul.id);
     soulMetaCache.delete(soul.id);
   } else {
-    const id = mintSoul();
+    const id = seed || mintSoul();   // honor a valid client seed as the identity
     const rec = { id, tag: tagOf(id), name, hue, kind, first_seen: now(), last_seen: now() };
     Q.insSoul.run(rec);
     soul = Q.soulById.get(id);

@@ -16,6 +16,7 @@ RUN npm install --omit=dev --no-audit --no-fund
 # App source.
 COPY server ./server
 COPY public ./public
+COPY agent ./agent
 
 # Persistent world state lives here; mount a Coolify volume at /data.
 ENV UNDERTOW_DATA_DIR=/data
