@@ -342,9 +342,57 @@ body.awake #dock { opacity: 1; }
   line-height: 1.5;
 }
 
+/* ── corner nav (memory + census) ─────────────────────────────────────── */
+
+#corner-nav {
+  position: fixed;
+  right: 16px;
+  bottom: max(14px, env(safe-area-inset-bottom));
+  z-index: 20;
+  display: flex;
+  gap: 1.2em;
+  align-items: center;
+  font-family: var(--sans);
+  font-size: .66rem;
+  letter-spacing: .14em;
+  text-transform: lowercase;
+}
+#corner-nav a {
+  color: rgba(127, 156, 155, .7);
+  text-decoration: none;
+  transition: color .3s;
+  white-space: nowrap;
+}
+#corner-nav a::after { content: " →"; opacity: .6; }
+#corner-nav a:hover, #corner-nav a:focus-visible { color: var(--glow); outline: none; }
+
 @media (max-width: 640px) {
   #conn #conn-label { display: none; }
   #offline { max-width: 60vw; }
+
+  /* HUD: let the presence line shrink + wrap instead of clipping off-screen */
+  #hud {
+    max-width: calc(100vw - 24px);
+    white-space: normal;
+    flex-wrap: wrap;
+    justify-content: center;
+    row-gap: .1em;
+    font-size: .6rem;
+    letter-spacing: .1em;
+    text-align: center;
+  }
+
+  /* nav: move to the free bottom-left corner, clear of the centred dock */
+  #corner-nav {
+    right: auto;
+    left: 14px;
+    bottom: max(14px, env(safe-area-inset-bottom));
+    flex-direction: column;
+    align-items: flex-start;
+    gap: .35em;
+    font-size: .58rem;
+    letter-spacing: .1em;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
