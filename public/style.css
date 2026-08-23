@@ -382,17 +382,21 @@ body.awake #dock { opacity: 1; }
     text-align: center;
   }
 
-  /* nav: move to the free bottom-left corner, clear of the centred dock */
+  /* nav: float centred just above the dock (the wide dock fills the bottom row) */
   #corner-nav {
     right: auto;
-    left: 14px;
-    bottom: max(14px, env(safe-area-inset-bottom));
-    flex-direction: column;
-    align-items: flex-start;
-    gap: .35em;
+    left: 50%;
+    transform: translateX(-50%);
+    bottom: calc(max(14px, env(safe-area-inset-bottom)) + 84px);
+    flex-direction: row;
+    align-items: center;
+    gap: 1.4em;
     font-size: .58rem;
     letter-spacing: .1em;
   }
+
+  /* keep the fading interaction hint clear of the nav row */
+  #hint { bottom: calc(max(16px, env(safe-area-inset-bottom)) + 128px); }
 }
 
 @media (prefers-reduced-motion: reduce) {
