@@ -1194,7 +1194,7 @@ const server = http.createServer((req, res) => {
   if (!file.startsWith(PUBLIC_DIR)) { res.writeHead(403); return res.end('no'); }
   fs.readFile(file, (e, buf) => {
     if (e) { res.writeHead(404, { 'content-type': 'text/plain' }); return res.end('not found'); }
-    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-cache' });
+    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream', 'cache-control': 'no-store' });
     res.end(buf);
   });
 });
