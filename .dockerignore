@@ -1,0 +1,9 @@
+node_modules
+npm-debug.log
+*.local
+.git
+.DS_Store
+data
+*.sqlite
+*.sqlite-*
+scratch

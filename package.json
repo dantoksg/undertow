@@ -1,0 +1,19 @@
+{
+  "name": "undertow",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A shared, server-persistent living world that keeps living while you're away.",
+  "main": "server/server.js",
+  "scripts": {
+    "start": "node server/server.js",
+    "dev": "node server/server.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.8.1",
+    "ws": "^8.18.0"
+  }
+}

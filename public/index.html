@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#04070d">
+<title>Undertow — one pool, kept by the tide</title>
+<meta name="description" content="A shared tide pool that keeps living while you're away. Not everyone here is human.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><circle cx='50' cy='50' r='34' fill='%2304070d'/><circle cx='50' cy='50' r='30' fill='none' stroke='%234fd8c4' stroke-width='3' opacity='0.9'/><circle cx='50' cy='50' r='12' fill='%234fd8c4' opacity='0.55'/></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<canvas id="pool" aria-label="the tide pool"></canvas>
+
+<!-- arrival veil: fades away once the world breathes -->
+<div id="veil">
+  <div class="veil-mark">Undertow</div>
+  <div class="veil-sub">one pool, kept by the tide</div>
+</div>
+
+<!-- the return whisper -->
+<div id="whisper" aria-live="polite"></div>
+
+<!-- top hud: tide + presence -->
+<header id="hud">
+  <span id="hud-tide">the tide is turning</span>
+  <span id="hud-dot">·</span>
+  <span id="hud-souls">…</span>
+</header>
+
+<!-- connection state -->
+<div id="conn" class="off" title="connection">
+  <span class="conn-dot"></span><span id="conn-label">adrift</span>
+</div>
+
+<!-- flora inspection card -->
+<div id="card" hidden>
+  <div id="card-word">'word'</div>
+  <div id="card-meta">planted by someone, some time ago</div>
+  <button id="card-tend" class="ghost-btn">tend</button>
+</div>
+
+<!-- bottom actions -->
+<nav id="dock">
+  <button id="act-pulse" class="dock-btn" title="pulse — hold anywhere, or space">
+    <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2" fill="currentColor"/><circle cx="12" cy="12" r="8" fill="none" stroke="currentColor" stroke-width="1.4" opacity=".55"/></svg>
+    <span>pulse</span>
+  </button>
+  <button id="act-sing" class="dock-btn" title="sing — keys 1 to 8">
+    <svg viewBox="0 0 24 24"><path d="M6 17V6l11-2v11" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/><circle cx="4.6" cy="17.4" r="2.4" fill="currentColor"/><circle cx="15.6" cy="15.4" r="2.4" fill="currentColor"/></svg>
+    <span>sing</span>
+  </button>
+  <button id="act-plant" class="dock-btn" title="plant one word">
+    <svg viewBox="0 0 24 24"><path d="M12 20v-7" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M12 13c0-4 2.6-6.5 6.5-6.5C18.5 10.5 16 13 12 13Z" fill="currentColor" opacity=".85"/><path d="M12 13c0-3-2-5-5-5 0 3 2 5 5 5Z" fill="currentColor" opacity=".5"/></svg>
+    <span>plant</span>
+  </button>
+  <button id="act-sound" class="dock-btn" title="sound">
+    <svg id="ic-sound-on" viewBox="0 0 24 24" hidden><path d="M4 9v6h4l5 4V5L8 9H4Z" fill="currentColor"/><path d="M16.5 8.5a5 5 0 0 1 0 7" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    <svg id="ic-sound-off" viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4Z" fill="currentColor" opacity=".55"/><path d="M16 9.5 21 14.5M21 9.5 16 14.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+    <span>sound</span>
+  </button>
+</nav>
+
+<!-- the note fan (sing) -->
+<div id="notefan" hidden>
+  <button class="note" data-note="0"></button><button class="note" data-note="1"></button>
+  <button class="note" data-note="2"></button><button class="note" data-note="3"></button>
+  <button class="note" data-note="4"></button><button class="note" data-note="5"></button>
+  <button class="note" data-note="6"></button><button class="note" data-note="7"></button>
+</div>
+
+<!-- plant input -->
+<div id="plantbox" hidden>
+  <label for="plant-word">one word to leave in the water</label>
+  <input id="plant-word" maxlength="16" autocomplete="off" spellcheck="false"
+         placeholder="patience" pattern="[\p{L}'-]{1,16}">
+  <div class="plant-hint">then touch the water where it should grow</div>
+</div>
+
+<!-- naming (first visit, non-blocking) -->
+<div id="namebox" hidden>
+  <div class="name-ask">what should the pool call you?</div>
+  <form id="nameform">
+    <input id="name-word" maxlength="16" autocomplete="off" spellcheck="false" placeholder="one small word">
+    <button type="submit" class="ghost-btn">so be it</button>
+  </form>
+  <button id="name-skip" class="skip-btn">remain nameless</button>
+</div>
+
+<!-- fading hint line -->
+<div id="hint"></div>
+
+<!-- offline banner -->
+<div id="offline" hidden>you are drifting offline — this is only a memory of the pool</div>
+
+<script src="client.js"></script>
+</body>
+</html>
