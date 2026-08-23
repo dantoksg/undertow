@@ -267,6 +267,38 @@ function playChime() { // growth / arrival sparkle
   });
 }
 
+function playChord(note, x) {
+  // the pool answers a chorus: a soft chord stacked up the same pentatonic
+  // scale the singers used, swelling in slowly and letting go even slower
+  if (!A.ctx || !S.soundOn) return;
+  const t = A.ctx.currentTime;
+  const root = clamp(Math.trunc(note) || 0, 0, 7);
+  const p = A.ctx.createStereoPanner ? A.ctx.createStereoPanner() : null;
+  const bus = A.ctx.createGain(); bus.gain.value = 1;
+  if (p) { p.pan.value = pan(x) * 0.5; bus.connect(p); p.connect(A.master); }
+  else bus.connect(A.master);
+  [0, 2, 4].forEach((step, i) => {
+    const f = NOTE_FREQ[(root + step) % 8] * (root + step >= 8 ? 2 : 1);
+    const o = A.ctx.createOscillator(); o.type = 'sine'; o.frequency.value = f;
+    const o2 = A.ctx.createOscillator(); o2.type = 'triangle'; o2.frequency.value = f; o2.detune.value = 3;
+    const g = A.ctx.createGain();
+    const at = t + i * 0.22;                        // voices arrive one by one
+    g.gain.setValueAtTime(0, at);
+    g.gain.linearRampToValueAtTime(0.05, at + 0.5);
+    g.gain.exponentialRampToValueAtTime(0.0001, at + 5.5);
+    const g2 = A.ctx.createGain(); g2.gain.value = 0.4;
+    o.connect(g); o2.connect(g2); g2.connect(g); g.connect(bus);
+    o.start(at); o2.start(at); o.stop(at + 6); o2.stop(at + 6);
+  });
+  const ob = A.ctx.createOscillator();              // a low root beneath it all
+  ob.type = 'sine'; ob.frequency.value = NOTE_FREQ[root] / 2;
+  const gb = A.ctx.createGain();
+  gb.gain.setValueAtTime(0, t);
+  gb.gain.linearRampToValueAtTime(0.035, t + 0.8);
+  gb.gain.exponentialRampToValueAtTime(0.0001, t + 6);
+  ob.connect(gb); gb.connect(bus); ob.start(t); ob.stop(t + 6.5);
+}
+
 /* ── networking ────────────────────────────────────────────────────────── */
 
 let ws = null;
@@ -393,7 +425,10 @@ function onEvent(ev) {
   const mine = S.me && ev.id === S.me.id;
   switch (ev.e) {
     case 'pulse':
-      if (!mine) { spawnPulse(ev.x, ev.y, ev.hue); playPulse(ev.x, true); }
+      if (!mine) {
+        spawnPulse(ev.x, ev.y, ev.hue); playPulse(ev.x, true);
+        nudgeSelf(ev.x, ev.y);   // the ripple shoves you too, softly
+      }
       break;
     case 'sing':
       if (!mine) {
@@ -446,7 +481,39 @@ function onEvent(ev) {
     case 'tide':
       flashHint(ev.dir === 'high' ? 'high water' : 'the tide is at its lowest');
       break;
+    case 'chorus':
+      // three or more voices found each other — the whole pool sings back
+      spawnChorus(ev.x, ev.y, ev.count);
+      playChord(ev.note ?? 0, ev.x);
+      flashHint('the pool sings back');
+      break;
+    case 'communal': {
+      // a plant surged, raised by many hands
+      const f = S.flora.get(ev.id);
+      const cx = ev.x ?? f?.x, cy = ev.y ?? f?.y;
+      if (f) { f.radiantUntil = performance.now() + 60000; f.growFlash = performance.now(); }
+      if (cx != null && cy != null) {
+        spawnCommunal(cx, cy, ev.hue ?? f?.hue ?? 170, ev.hands);
+        playChime();
+        playNote(Math.round((((ev.hue ?? 170) % 360) + 360) / 45) % 8, cx, true);
+      }
+      flashHint('raised by many hands');
+      break;
+    }
   }
+}
+
+/* the ripple of a nearby pulse gives you a gentle outward shove — mirroring
+   the server's nudge so it is felt at once, not a beat later */
+function nudgeSelf(px, py) {
+  if (!S.me || S.sim) return;
+  let dx = S.me.x - px, dy = S.me.y - py, d = Math.hypot(dx, dy);
+  if (d > 200) return;
+  if (d < 1) { const a = Math.random() * TAU; dx = Math.cos(a); dy = Math.sin(a); d = 1; }
+  const mag = 48 * (1 - d / 200);
+  const ux = dx / d, uy = dy / d;
+  [S.me.x, S.me.y] = clampToPool(S.me.x + ux * mag * 0.45, S.me.y + uy * mag * 0.45);
+  [S.me.tx, S.me.ty] = clampToPool(S.me.tx + ux * mag, S.me.ty + uy * mag);
 }
 
 function addDrifter(d) {
@@ -586,6 +653,38 @@ function spawnBloom(x, y, hue) {
     kind: 'bloom', x, y, hue, spores,
     t0: performance.now(),
     life: REDUCED_MOTION ? 1100 : 1600,
+  });
+}
+
+function spawnChorus(x, y, count) {
+  // the pool answering a chorus: one swelling shimmer, shared by everyone
+  S.effects.push({
+    kind: 'chorus', x, y, count: count || 3,
+    t0: performance.now(), life: REDUCED_MOTION ? 3200 : 5200,
+  });
+  exciteMotes(x, y, REDUCED_MOTION ? 0.6 : 1.5);
+}
+
+function spawnCommunal(x, y, hue, hands) {
+  // a bloom raised by many hands: light gathers in a ring, then lifts
+  const n = clamp(hands || 3, 3, 8);
+  const sparks = [];
+  if (!REDUCED_MOTION) {
+    const m = LOW_POWER ? n : n * 2;
+    for (let i = 0; i < m; i++) {
+      sparks.push({
+        a: (i / m) * TAU + Math.random() * 0.4,
+        r0: 26 + Math.random() * 20,
+        rise: 80 + Math.random() * 90,
+        delay: Math.random() * 0.4,
+        sz: 1.1 + Math.random() * 1.7,
+      });
+    }
+    exciteMotes(x, y, 1.2);
+  }
+  S.effects.push({
+    kind: 'communal', x, y, hue, hands: n, sparks,
+    t0: performance.now(), life: REDUCED_MOTION ? 2200 : 4200,
   });
 }
 
@@ -1279,22 +1378,37 @@ function drawPlant(f, pn, current) {
     }
   }
 
+  // a communal surge leaves a bloom radiant for a while — many hands still felt
+  const radiant = f.stage === 3 && f.radiantUntil && pn < f.radiantUntil
+    ? clamp((f.radiantUntil - pn) / 60000, 0, 1) : 0;
+
   // tip bulb
   const pulse = f.stage === 3 ? 0.55 + 0.45 * Math.sin(pn * 0.0016 + f.phase) : 0.5;
-  const bulbR = (f.stage === 3 ? 7 : f.stage === 1 ? 3 : 4.4) * s;
+  const bulbR = (f.stage === 3 ? 7 : f.stage === 1 ? 3 : 4.4) * s * (1 + radiant * 0.25);
   if (!husk) {
     const gg = ctx.createRadialGradient(tipX, tipY, 0, tipX, tipY, bulbR * 5);
-    const ba = (f.stage === 3 ? 0.5 : 0.3) * glow * pulse + flash * 0.4;
+    const ba = (f.stage === 3 ? 0.5 : 0.3) * glow * pulse + flash * 0.4 + radiant * 0.18;
     gg.addColorStop(0, `hsla(${hue}, 85%, 70%, ${ba})`);
     gg.addColorStop(1, `hsla(${hue}, 85%, 70%, 0)`);
     ctx.fillStyle = gg;
     ctx.beginPath(); ctx.arc(tipX, tipY, bulbR * 5, 0, TAU); ctx.fill();
     ctx.fillStyle = `hsla(${hue}, 90%, ${withered ? 45 : 78}%, ${0.5 + glow * 0.4})`;
     ctx.beginPath(); ctx.arc(tipX, tipY, bulbR, 0, TAU); ctx.fill();
+    if (radiant > 0) {
+      // a slow halo turns about the radiant bloom while the surge lasts
+      const wob = REDUCED_MOTION ? 0 : Math.sin(pn * 0.0011 + f.phase);
+      const ra = (0.14 + (REDUCED_MOTION ? 0 : 0.10 * Math.sin(pn * 0.003 + f.phase))) * radiant;
+      ctx.strokeStyle = `hsla(${hue}, 90%, 80%, ${ra})`;
+      ctx.lineWidth = Math.max(1, 1.4 * s);
+      ctx.beginPath();
+      ctx.ellipse(tipX, tipY, bulbR * (2.6 + wob * 0.4), bulbR * (2.0 - wob * 0.3),
+                  REDUCED_MOTION ? 0 : pn * 0.0003, 0, TAU);
+      ctx.stroke();
+    }
   }
 
-  // bloom sheds spores
-  if (f.stage === 3 && Math.random() < (LOW_POWER ? 0.004 : 0.008) &&
+  // bloom sheds spores (a radiant bloom sheds more freely)
+  if (f.stage === 3 && Math.random() < (LOW_POWER ? 0.004 : 0.008) * (radiant > 0 ? 2.5 : 1) &&
       S.motes.length < MOTE_CAP) {
     S.motes.push({
       x: f.x, y: f.y - heights[3], vx: (Math.random() - 0.5) * 3, vy: -1.5,
@@ -1405,6 +1519,68 @@ function drawEffects(pn) {
         const qy = (1 - k) * (1 - k) * y + 2 * (1 - k) * k * my + k * k * y2;
         ctx.fillStyle = `hsla(${e.hue2}, 90%, 80%, ${0.8 * (1 - k)})`;
         ctx.beginPath(); ctx.arc(qx, qy, 2.4 * cam.s, 0, TAU); ctx.fill();
+      }
+    } else if (e.kind === 'chorus') {
+      // the pool sings back — a shared swell of light rising through the water
+      const swell = Math.sin(Math.PI * k);
+      ctx.fillStyle = `hsla(185, 70%, 62%, ${swell * (LOW_POWER ? 0.03 : 0.045)})`;
+      ctx.fillRect(0, 0, cam.W, cam.H);              // the whole water brightens
+      const R = (REDUCED_MOTION ? 420 : 160 + (1 - Math.pow(1 - k, 3)) * 560) * cam.s;
+      const cg = ctx.createRadialGradient(x, y, 0, x, y, R);
+      cg.addColorStop(0, `hsla(178, 80%, 70%, ${swell * 0.16})`);
+      cg.addColorStop(0.55, `hsla(220, 70%, 68%, ${swell * 0.07})`);
+      cg.addColorStop(1, 'hsla(258, 70%, 70%, 0)');
+      ctx.fillStyle = cg;
+      ctx.beginPath(); ctx.arc(x, y, R, 0, TAU); ctx.fill();
+      if (!REDUCED_MOTION) {
+        const rings = LOW_POWER ? 2 : 3;
+        for (let i = 0; i < rings; i++) {
+          const kk = clamp(k * 1.35 - i * 0.16, 0, 1);
+          if (kk <= 0 || kk >= 1) continue;
+          const rr = kk * 540 * cam.s;
+          ctx.strokeStyle = `hsla(190, 80%, 70%, ${(1 - kk) * 0.22})`;
+          ctx.lineWidth = Math.max(1, (1 - kk) * 2.2);
+          ctx.beginPath(); ctx.ellipse(x, y, rr, rr * 0.8, 0, 0, TAU); ctx.stroke();
+        }
+        // a few glints circle the centre, like voices finding each other
+        const gl = LOW_POWER ? 4 : 7;
+        for (let i = 0; i < gl; i++) {
+          const a = (i / gl) * TAU + k * 1.8 + (e.t0 % 10);
+          const rr = (70 + k * 240) * cam.s;
+          ctx.fillStyle = `hsla(${172 + i * 12}, 85%, 78%, ${swell * 0.5})`;
+          ctx.beginPath();
+          ctx.arc(x + Math.cos(a) * rr, y + Math.sin(a) * rr * 0.8, 1.8 * cam.s, 0, TAU);
+          ctx.fill();
+        }
+      }
+    } else if (e.kind === 'communal') {
+      // a plant raised by many hands — light gathers around it, then lifts
+      const swell = Math.sin(Math.PI * k);
+      const ease = 1 - Math.pow(1 - k, 3);
+      const R = (REDUCED_MOTION ? 120 : 50 + ease * 210) * cam.s;
+      const bg = ctx.createRadialGradient(x, y, 0, x, y, R);
+      bg.addColorStop(0, `hsla(${e.hue}, 90%, 74%, ${swell * 0.4})`);
+      bg.addColorStop(0.6, `hsla(${e.hue}, 85%, 66%, ${swell * 0.14})`);
+      bg.addColorStop(1, `hsla(${e.hue}, 85%, 66%, 0)`);
+      ctx.fillStyle = bg;
+      ctx.beginPath(); ctx.arc(x, y, R, 0, TAU); ctx.fill();
+      if (!REDUCED_MOTION) {
+        for (const mul of [0.8, 0.55]) {
+          ctx.strokeStyle = `hsla(${e.hue}, 90%, 76%, ${swell * 0.5 * mul})`;
+          ctx.lineWidth = Math.max(1, (1 - k) * 2);
+          ctx.beginPath(); ctx.ellipse(x, y, R * mul, R * mul * 0.7, 0, 0, TAU); ctx.stroke();
+        }
+        // sparks rise from a ring around the base — the many hands, lifting
+        for (const sp of e.sparks) {
+          const kk = clamp((k - sp.delay) / (1 - sp.delay), 0, 1);
+          if (kk <= 0) continue;
+          const lift = 1 - Math.pow(1 - kk, 2);
+          const sx = x + Math.cos(sp.a) * sp.r0 * (1 - lift * 0.55) * cam.s;
+          const sy = y - sp.rise * lift * cam.s
+                   + Math.sin(sp.a) * sp.r0 * 0.4 * (1 - lift) * cam.s;
+          ctx.fillStyle = `hsla(${e.hue}, 90%, 82%, ${0.85 * (1 - kk)})`;
+          ctx.beginPath(); ctx.arc(sx, sy, sp.sz * cam.s, 0, TAU); ctx.fill();
+        }
       }
     } else if (e.kind === 'dream') {
       // the pool murmurs last night's dream — a line surfaces, then dissolves

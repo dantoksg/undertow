@@ -27,6 +27,15 @@ const MAX_FLORA = 400;
 const PLANT_REACH = 160;
 const TEND_REACH = 160;
 const PULSE_FEED_R = 120;
+const NUDGE_R = 200;                        // a pulse shoves neighbours within this
+const NUDGE_MAX = 48;                       // strongest single shove, world units
+const NUDGE_BUDGET = 90;                    // max shove any drifter absorbs per second
+const CHORUS_WINDOW_MS = 2500;              // 3+ distinct voices inside this → chorus
+const CHORUS_MIN = 3;
+const CHORUS_COOLDOWN_MS = 10_000;          // one chorus, then the pool catches its breath
+const COMMUNAL_WINDOW_MS = 10_000;          // 3+ distinct tenders/pulsers inside this
+const COMMUNAL_MIN = 3;
+const COMMUNAL_COOLDOWN_MS = 120_000;       // per-plant breather between surges
 const ECHO_TTL_MS = 10 * 60_000;
 const ECHO_CAP = 12;
 const WORD_RE = /^[\p{L}'-]{1,16}$/u;
@@ -103,7 +112,7 @@ const Q = {
   recentEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither') ORDER BY at DESC LIMIT ?`),
   lastSing: db.prepare(`SELECT MAX(at) t FROM events WHERE type='sing' AND soul_id=?`),
   eventsBetween: db.prepare(`SELECT * FROM events WHERE at >= ? AND at < ? ORDER BY at ASC`),
-  chronicleEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither','husk','dream') ORDER BY at DESC LIMIT ?`),
+  chronicleEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither','husk','dream','communal','chorus') ORDER BY at DESC LIMIT ?`),
   insDream: db.prepare(`INSERT INTO dreams(at,day,text) VALUES(?,?,?)`),
   latestDream: db.prepare(`SELECT * FROM dreams ORDER BY day DESC LIMIT 1`),
   lastDreamDay: db.prepare(`SELECT MAX(day) d FROM dreams`),
@@ -161,6 +170,9 @@ const byId = new Map();       // id -> drifter
 const restDrifters = new Map(); // soul -> drifter (HTTP participants; no socket)
 let echoes = [];              // recently departed
 const pending = [];           // event objects queued for next tick broadcast
+const singWindow = [];        // recent sings, watched for a chorus
+let lastChorusAt = 0;
+const communalTouches = new Map(); // flora id -> { touch:[{soul,at}], lastAt }
 
 function makeId() { let id; do { id = crypto.randomBytes(3).toString('hex'); } while (byId.has(id)); return id; }
 
@@ -399,6 +411,32 @@ function handle(ws, m) {
   applyAction(d, m, (msg) => err(ws, msg));
 }
 
+// Communal bloom: when several different souls tend or pulse the same living
+// plant inside a short window, the pool answers — the plant surges a stage
+// toward bloom (or turns radiant if already there), raised by many hands.
+function noteCommunalTouch(floraId, soul, t) {
+  let c = communalTouches.get(floraId);
+  if (!c) { c = { touch: [], lastAt: 0 }; communalTouches.set(floraId, c); }
+  c.touch = c.touch.filter(e => t - e.at < COMMUNAL_WINDOW_MS);
+  const prev = c.touch.find(e => e.soul === soul);
+  if (prev) prev.at = t; else c.touch.push({ soul, at: t });
+  if (t - c.lastAt < COMMUNAL_COOLDOWN_MS) return;
+  const hands = c.touch.length;                    // already distinct by soul
+  if (hands < COMMUNAL_MIN) return;
+  const f = Q.floraById.get(floraId);
+  if (!f || f.stage > STAGE.BLOOM) return;         // only living plants surge
+  c.lastAt = t; c.touch = [];
+  Q.updNourish.run(Math.min(6, f.nourish + 1.5), t, f.id);
+  if (f.stage < STAGE.BLOOM) {
+    const to = f.stage + 1;
+    Q.updStage.run(to, null, null, f.id);
+    pending.push({ e: 'grow', id: f.id, stage: to });
+    logEvent('grow', f.soul_id, f.id, { word: f.word, stage: to, owner: f.soul_id });
+  }
+  pending.push({ e: 'communal', id: f.id, x: Math.round(f.x), y: Math.round(f.y), hue: f.hue, hands });
+  logEvent('communal', null, f.id, { word: f.word, hands, owner: f.soul_id });
+}
+
 // One action verb, for any drifter — WebSocket-bound or REST. Errors go to onErr.
 // Returns a short human confirmation string on success (used by the REST reply).
 function applyAction(d, m, onErr) {
@@ -419,7 +457,24 @@ function applyAction(d, m, onErr) {
         if (f.stage >= STAGE.HUSK) continue;
         if (Math.hypot(f.x - d.x, f.y - d.y) <= PULSE_FEED_R) {
           const nv = Math.min(6, f.nourish + 0.15); Q.updNourishOnly.run(nv, f.id);
+          if (f.stage <= STAGE.BLOOM) noteCommunalTouch(f.id, d.soul, t);
         }
+      }
+      // the ripple gives every nearby drifter a soft outward shove — playful,
+      // distance-faded, and budgeted so a crowd of pulses can never fling anyone
+      for (const o of allDrifters()) {
+        if (o === d) continue;
+        let ox = o.x - d.x, oy = o.y - d.y, od = Math.hypot(ox, oy);
+        if (od > NUDGE_R) continue;
+        if (od < 1) { const a = Math.random() * 2 * Math.PI; ox = Math.cos(a); oy = Math.sin(a); od = 1; }
+        const nb = o.nudge || (o.nudge = { acc: 0, at: t });
+        nb.acc = Math.max(0, nb.acc - (t - nb.at) * (NUDGE_BUDGET / 1000)); nb.at = t;
+        const mag = Math.min(NUDGE_MAX * (1 - od / NUDGE_R), Math.max(0, NUDGE_BUDGET - nb.acc));
+        if (mag < 2) continue;
+        nb.acc += mag;
+        const ux = ox / od, uy = oy / od;
+        [o.x, o.y] = clampEllipse(o.x + ux * mag * 0.45, o.y + uy * mag * 0.45);
+        [o.tx, o.ty] = clampEllipse(o.tx + ux * mag, o.ty + uy * mag);
       }
       return 'a ring of light spreads out';
     }
@@ -429,6 +484,19 @@ function applyAction(d, m, onErr) {
       const note = clamp(Math.trunc(m.note), 0, 7); if (!Number.isFinite(note)) return onErr('a note is 0 to 7');
       d.rl.sing = t;
       pending.push({ e: 'sing', id: d.id, note, x: Math.round(d.x), y: Math.round(d.y), hue: d.hue });
+      // chorus: three or more distinct voices within a breath, and the pool sings back
+      singWindow.push({ soul: d.soul, x: d.x, y: d.y, at: t });
+      while (singWindow.length && t - singWindow[0].at > CHORUS_WINDOW_MS) singWindow.shift();
+      const voices = new Map();
+      for (const s of singWindow) voices.set(s.soul, s);
+      if (voices.size >= CHORUS_MIN && t - lastChorusAt >= CHORUS_COOLDOWN_MS) {
+        lastChorusAt = t;
+        let ccx = 0, ccy = 0;
+        for (const v of voices.values()) { ccx += v.x; ccy += v.y; }
+        pending.push({ e: 'chorus', note, x: Math.round(ccx / voices.size), y: Math.round(ccy / voices.size), count: voices.size });
+        logEvent('chorus', null, null, { count: voices.size });
+        singWindow.length = 0;
+      }
       const last = Q.lastSing.get(d.soul).t || 0;
       if (t - last > 600_000) logEvent('sing', d.soul, null, { name: d.name });
       return `you sang note ${note}`;
@@ -472,11 +540,13 @@ function applyAction(d, m, onErr) {
         logEvent('revive', d.soul, f.id, { word: f.word, byName: d.name, byKind: d.kind, owner: f.soul_id });
         pending.push({ e: 'revive', id: f.id, stage: back, by: d.name });
         pending.push({ e: 'tend', id: f.id, by: d.name, nourish: 1.0 });
+        noteCommunalTouch(f.id, d.soul, t);
         return `you brought '${f.word}' back from the edge`;
       }
       const nv = Math.min(6, f.nourish + 1.0); Q.updNourish.run(nv, t, f.id);
       logEvent('tend', d.soul, f.id, { word: f.word, byName: d.name, byKind: d.kind, owner: f.soul_id });
       pending.push({ e: 'tend', id: f.id, by: d.name, nourish: Math.round(nv * 100) / 100 });
+      noteCommunalTouch(f.id, d.soul, t);
       return `you tended '${f.word}'`;
     }
 
@@ -640,6 +710,15 @@ function drop(ws, code) {
 }
 setInterval(() => { const cut = now() - ECHO_TTL_MS; echoes = echoes.filter(e => e.leftAt > cut); }, 30_000);
 
+// forget stale communal touches so the map never grows unbounded
+setInterval(() => {
+  const t = now();
+  for (const [id, c] of communalTouches) {
+    c.touch = c.touch.filter(e => t - e.at < COMMUNAL_WINDOW_MS);
+    if (!c.touch.length && t - c.lastAt > COMMUNAL_COOLDOWN_MS) communalTouches.delete(id);
+  }
+}, 300_000);
+
 /* ───────────────────────── http + ws ───────────────────────── */
 
 const MIME = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.json': 'application/json', '.woff2': 'font/woff2', '.png': 'image/png', '.webmanifest': 'application/manifest+json' };
@@ -661,6 +740,8 @@ function chronicleLine(r) {
     case 'revive': return `&lsquo;${esc(d.word)}&rsquo; was brought back from the edge`;
     case 'wither': return `&lsquo;${esc(d.word)}&rsquo; began to wither`;
     case 'husk': return `&lsquo;${esc(d.word)}&rsquo; hardened to a husk`;
+    case 'communal': return `&lsquo;${esc(d.word)}&rsquo; was raised by ${d.hands || 'many'} hands`;
+    case 'chorus': return `${d.count || 'several'} voices found each other, and the pool sang back`;
     case 'dream': return `the pool dreamed`;
     default: return null;
   }
