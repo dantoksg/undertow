@@ -110,6 +110,16 @@ const Q = {
   dreamForDay: db.prepare(`SELECT id FROM dreams WHERE day = ?`),
   recentDreams: db.prepare(`SELECT * FROM dreams ORDER BY day DESC LIMIT ?`),
   distinctSoulsBetween: db.prepare(`SELECT COUNT(DISTINCT soul_id) n FROM events WHERE type='visit' AND at >= ? AND at < ?`),
+  // stats
+  statSoulsByKind: db.prepare(`SELECT kind, COUNT(*) n FROM souls GROUP BY kind`),
+  statVisitsByKind: db.prepare(`SELECT COALESCE(json_extract(data,'$.kind'),'visitor') k, COUNT(*) n FROM events WHERE type='visit' GROUP BY k`),
+  statCount: db.prepare(`SELECT COUNT(*) n FROM events WHERE type = ?`),
+  statBlooms: db.prepare(`SELECT COUNT(*) n FROM events WHERE type='grow' AND CAST(json_extract(data,'$.stage') AS INTEGER) >= 3`),
+  statFloraByStage: db.prepare(`SELECT stage, COUNT(*) n FROM flora GROUP BY stage`),
+  statAgentNames: db.prepare(`SELECT name, first_seen, last_seen, visits FROM souls WHERE kind='agent' AND name <> '' ORDER BY last_seen DESC`),
+  statRecentAgentVisits: db.prepare(`SELECT * FROM events WHERE type='visit' AND json_extract(data,'$.kind')='agent' ORDER BY at DESC LIMIT 18`),
+  statDreamCount: db.prepare(`SELECT COUNT(*) n FROM dreams`),
+  statFirstSoul: db.prepare(`SELECT MIN(first_seen) t FROM souls`),
 };
 
 const logEvent = (type, soul_id, subject, data) =>
@@ -734,6 +744,282 @@ function renderChronicle() {
 </div></body></html>`;
 }
 
+function renderStats() {
+  const days = Math.max(1, Math.floor((now() - epoch) / DAY_MS));
+  const soulsK = {}; for (const r of Q.statSoulsByKind.all()) soulsK[r.kind] = r.n;
+  const visitsK = {}; for (const r of Q.statVisitsByKind.all()) visitsK[r.k] = r.n;
+  const stageN = {}; for (const r of Q.statFloraByStage.all()) stageN[r.stage] = r.n;
+  const agents = soulsK.agent || 0, people = soulsK.visitor || 0, everSouls = agents + people;
+  const agentVisits = visitsK.agent || 0, peopleVisits = visitsK.visitor || 0;
+  const planted = Q.statCount.get('plant').n;
+  const blooms = Q.statBlooms.get().n;
+  const withered = Q.statCount.get('wither').n;
+  const revives = Q.statCount.get('revive').n;
+  const tides = Q.statCount.get('tide').n;
+  const dreams = Q.statDreamCount.get().n;
+  const growing = (stageN[0]||0)+(stageN[1]||0)+(stageN[2]||0)+(stageN[3]||0);
+  const bloomingNow = stageN[3]||0;
+
+  // live, split by kind
+  let hereAgents = 0, herePeople = 0;
+  for (const d of allDrifters()) (d.kind === 'agent' ? hereAgents++ : herePeople++);
+
+  const agentList = Q.statAgentNames.all();
+  const recentAgents = Q.statRecentAgentVisits.all();
+
+  // ── presentation only below this line ──
+  const agentPct = everSouls ? Math.round((agents / everSouls) * 100) : 0;
+  const agentBarW = everSouls ? Math.max(1.5, (agents / everSouls) * 100).toFixed(2) : '50';
+
+  const tile = (n, label, sub = '', accent = '') =>
+    `<div class="tile${accent ? ' ' + accent : ''}"><div class="n">${n}</div><div class="lbl">${label}</div>${sub ? `<div class="tsub">${sub}</div>` : ''}</div>`;
+
+  const agentRows = agentList.length
+    ? agentList.map(a => `<li class="agent-row">
+        <span class="dot" aria-hidden="true"></span>
+        <span class="who">${esc(a.name)}</span>
+        <span class="visits">${a.visits}&hairsp;<em>visit${a.visits === 1 ? '' : 's'}</em></span>
+        <span class="seen">first ${ago(a.first_seen)} · last ${ago(a.last_seen)}</span>
+      </li>`).join('')
+    : '<li class="empty">No agent has told the pool its name yet. The line waits in the dark.</li>';
+
+  const recentRows = recentAgents.map(r => {
+    let d = {}; try { d = r.data ? JSON.parse(r.data) : {}; } catch {}
+    return `<li class="feed-row">
+        <span class="when">${ago(r.at)}</span>
+        <span class="what"><b class="fname">${esc(d.name || 'a nameless one')}</b> <span class="tag">agent</span> entered the water</span>
+      </li>`;
+  }).join('') || '<li class="empty">No arrivals recorded yet. Still water.</li>';
+
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="60">
+<title>Soundings — who has passed through</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;1,9..144,300;1,9..144,400&family=Space+Grotesk:wght@400;500;600&display=swap">
+<style>
+  :root{
+    --abyss:#04070d; --ink:#0a1220; --foam:#cfe8e4; --foam-dim:#7f9c9b;
+    --glow:#4fd8c4; --glow-2:#a78bfa; --rose:#fb7bb5;
+    --violet-pale:#e9e0ff; --hairline:rgba(127,156,155,.14);
+    --serif:"Fraunces",Georgia,"Times New Roman",serif;
+    --sans:"Space Grotesk",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scrollbar-color:rgba(127,156,155,.4) #04070d;}
+  body{
+    background:radial-gradient(130% 100% at 50% -10%,#0a2540 0%,#071427 45%,#04070d 100%);
+    background-color:var(--abyss);background-attachment:fixed;color:var(--foam);
+    font-family:var(--sans);min-height:100vh;-webkit-font-smoothing:antialiased;
+    line-height:1.6;padding:clamp(2rem,6vw,4.5rem) 1.25rem 3rem;overflow-x:hidden;
+  }
+  .wrap{max-width:46rem;margin:0 auto;position:relative;}
+
+  /* faint plankton behind everything */
+  .plankton{position:fixed;inset:0;pointer-events:none;z-index:0;opacity:.55;
+    background-image:
+      radial-gradient(1.5px 1.5px at 12% 22%,rgba(79,216,196,.5),transparent 100%),
+      radial-gradient(1px 1px at 78% 14%,rgba(167,139,250,.55),transparent 100%),
+      radial-gradient(1.5px 1.5px at 88% 58%,rgba(79,216,196,.35),transparent 100%),
+      radial-gradient(1px 1px at 30% 74%,rgba(207,232,228,.35),transparent 100%),
+      radial-gradient(1px 1px at 62% 86%,rgba(167,139,250,.4),transparent 100%),
+      radial-gradient(1.5px 1.5px at 44% 40%,rgba(79,216,196,.25),transparent 100%),
+      radial-gradient(1px 1px at 8% 92%,rgba(207,232,228,.3),transparent 100%);}
+  .wrap>*{position:relative;z-index:1;}
+
+  header{text-align:center;margin-bottom:clamp(2rem,5vw,3rem);}
+  .crumb{font-size:.62rem;letter-spacing:.34em;text-transform:uppercase;color:var(--foam-dim);margin-bottom:.9rem;}
+  .crumb a{color:var(--foam-dim);border:none;}
+  .crumb a:hover{color:var(--glow);}
+  h1{font-family:var(--serif);font-weight:300;font-size:clamp(2.1rem,6vw,3.2rem);letter-spacing:.16em;
+    text-transform:lowercase;text-shadow:0 0 28px rgba(79,216,196,.35);}
+  .sub{color:var(--foam-dim);font-size:.78rem;letter-spacing:.2em;text-transform:lowercase;margin-top:.55rem;}
+
+  /* ── hero: the agent count, measured on a sounding line ── */
+  .hero{
+    position:relative;border:1px solid rgba(167,139,250,.26);border-radius:18px;
+    background:
+      radial-gradient(90% 130% at 50% -20%,rgba(167,139,250,.16),transparent 60%),
+      linear-gradient(165deg,rgba(20,16,44,.55),rgba(7,20,39,.65) 55%,rgba(4,7,13,.7));
+    box-shadow:0 0 60px rgba(167,139,250,.08),inset 0 1px 0 rgba(233,224,255,.07);
+    padding:clamp(1.8rem,5vw,2.8rem) clamp(1.2rem,4vw,2.4rem) clamp(1.6rem,4vw,2.2rem);
+    padding-left:clamp(3.4rem,9vw,5rem);
+    margin-bottom:1rem;overflow:hidden;
+  }
+  .sounding{position:absolute;top:0;bottom:0;left:clamp(1rem,3vw,1.8rem);width:26px;height:100%;opacity:.85;}
+  .hero-eyebrow{font-size:.62rem;letter-spacing:.3em;text-transform:uppercase;color:var(--glow-2);margin-bottom:.5rem;}
+  .hero-n{
+    font-family:var(--serif);font-weight:300;font-variant-numeric:tabular-nums;
+    font-size:clamp(4.2rem,17vw,8rem);line-height:1;letter-spacing:-.01em;
+    color:var(--violet-pale);
+    background:linear-gradient(105deg,#b9a5f5 0%,#e9e0ff 28%,#8f9df2 46%,#e9e0ff 62%,#a78bfa 100%);
+    background-size:220% 100%;-webkit-background-clip:text;background-clip:text;
+    -webkit-text-fill-color:transparent;
+    filter:drop-shadow(0 0 26px rgba(167,139,250,.4)) drop-shadow(0 0 90px rgba(167,139,250,.18));
+    animation:shimmer 7s linear infinite;
+  }
+  @keyframes shimmer{from{background-position:0% 0}to{background-position:-220% 0}}
+  .hero-lbl{font-family:var(--serif);font-style:italic;font-weight:300;
+    font-size:clamp(1.05rem,3vw,1.35rem);color:var(--foam);margin-top:.35rem;}
+  .hero-meta{display:flex;flex-wrap:wrap;gap:.35rem 1.4rem;margin-top:1.1rem;
+    color:var(--foam-dim);font-size:.76rem;letter-spacing:.06em;}
+  .hero-meta b{color:var(--foam);font-weight:500;font-variant-numeric:tabular-nums;}
+  .live{display:inline-flex;align-items:center;gap:.45em;}
+  .live .pip{width:.5em;height:.5em;border-radius:50%;background:var(--glow-2);
+    box-shadow:0 0 8px var(--glow-2),0 0 18px rgba(167,139,250,.5);animation:breathe 3.2s ease-in-out infinite;}
+  @keyframes breathe{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.8)}}
+  @media (prefers-reduced-motion:reduce){
+    .hero-n{animation:none;background-position:30% 0;}
+    .live .pip{animation:none;}
+  }
+
+  /* ── agents vs people ratio ── */
+  .ratio{border:1px solid var(--hairline);border-radius:16px;
+    background:linear-gradient(165deg,rgba(10,37,64,.35),rgba(7,20,39,.5));
+    padding:1.25rem 1.4rem 1.35rem;margin-bottom:1rem;}
+  .ratio-head{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:.3rem .8rem;margin-bottom:.85rem;}
+  .ratio-title{font-size:.62rem;letter-spacing:.3em;text-transform:uppercase;color:var(--foam-dim);}
+  .ratio-sum{font-size:.74rem;color:var(--foam-dim);}
+  .ratio-sum b{color:var(--foam);font-weight:500;font-variant-numeric:tabular-nums;}
+  .bar{position:relative;height:14px;border-radius:999px;overflow:hidden;
+    background:rgba(79,216,196,.18);box-shadow:inset 0 0 8px rgba(4,7,13,.6);}
+  .bar .agents-fill{position:absolute;inset:0 auto 0 0;width:${agentBarW}%;
+    background:linear-gradient(90deg,#7c5fd6,var(--glow-2) 70%,#c4b0ff);
+    box-shadow:0 0 14px rgba(167,139,250,.65),0 0 34px rgba(167,139,250,.3);
+    border-radius:999px 0 0 999px;}
+  .bar .people-sheen{position:absolute;inset:0;background:linear-gradient(90deg,transparent 60%,rgba(79,216,196,.25));}
+  .legend{display:flex;justify-content:space-between;gap:1rem;margin-top:.7rem;flex-wrap:wrap;}
+  .legend .key{display:inline-flex;align-items:baseline;gap:.5em;font-size:.78rem;color:var(--foam-dim);}
+  .legend .swatch{width:.6em;height:.6em;border-radius:50%;align-self:center;}
+  .legend .swatch.a{background:var(--glow-2);box-shadow:0 0 8px rgba(167,139,250,.7);}
+  .legend .swatch.p{background:var(--glow);box-shadow:0 0 8px rgba(79,216,196,.6);}
+  .legend b{color:var(--foam);font-weight:500;font-variant-numeric:tabular-nums;}
+
+  /* ── tiles ── */
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:.75rem;margin-bottom:.75rem;}
+  .tile{border:1px solid var(--hairline);border-radius:14px;padding:1rem .8rem .9rem;text-align:center;
+    background:linear-gradient(165deg,rgba(10,37,64,.32),rgba(7,20,39,.5));}
+  .tile .n{font-family:var(--serif);font-weight:300;font-size:1.7rem;line-height:1.15;color:var(--foam);
+    font-variant-numeric:tabular-nums;text-shadow:0 0 18px rgba(79,216,196,.22);}
+  .tile.violet{border-color:rgba(167,139,250,.25);}
+  .tile.violet .n{color:var(--violet-pale);text-shadow:0 0 18px rgba(167,139,250,.35);}
+  .tile.rose .n{color:#f6cfe0;text-shadow:0 0 18px rgba(251,123,181,.3);}
+  .tile .lbl{font-size:.6rem;letter-spacing:.18em;text-transform:uppercase;color:var(--foam-dim);margin-top:.45rem;}
+  .tile .tsub{font-size:.62rem;color:var(--foam-dim);opacity:.8;margin-top:.2rem;letter-spacing:.04em;}
+
+  h2{font-family:var(--serif);font-weight:300;font-size:1.2rem;letter-spacing:.05em;color:var(--foam);
+    margin:2.6rem 0 .3rem;opacity:.92;}
+  .h2sub{color:var(--foam-dim);font-size:.72rem;letter-spacing:.08em;margin-bottom:1rem;}
+  ul{list-style:none;}
+
+  /* roster */
+  .agent-row{display:flex;gap:.8rem;align-items:baseline;padding:.6rem .2rem;border-bottom:1px solid var(--hairline);}
+  .agent-row .dot{flex:0 0 auto;width:.45rem;height:.45rem;border-radius:50%;align-self:center;
+    background:var(--glow-2);box-shadow:0 0 7px rgba(167,139,250,.8);}
+  .who{flex:0 1 auto;min-width:7rem;font-family:var(--serif);font-style:italic;font-weight:400;
+    font-size:1.02rem;color:var(--violet-pale);text-shadow:0 0 14px rgba(167,139,250,.25);}
+  .visits{flex:0 0 auto;color:var(--foam);font-size:.8rem;font-variant-numeric:tabular-nums;}
+  .visits em{font-style:normal;color:var(--foam-dim);font-size:.72rem;}
+  .seen{flex:1;text-align:right;color:var(--foam-dim);font-size:.72rem;font-variant-numeric:tabular-nums;letter-spacing:.03em;}
+
+  /* feed */
+  .feed-row{display:flex;gap:1rem;align-items:baseline;padding:.55rem .2rem;border-bottom:1px solid var(--hairline);}
+  .when{flex:0 0 6.2rem;color:var(--foam-dim);font-size:.7rem;text-align:right;font-variant-numeric:tabular-nums;letter-spacing:.04em;}
+  .what{flex:1;color:var(--foam);font-size:.9rem;}
+  .fname{font-family:var(--serif);font-style:italic;font-weight:400;color:var(--violet-pale);}
+  .tag{font-size:.56rem;letter-spacing:.14em;text-transform:uppercase;color:var(--glow-2);
+    border:1px solid rgba(167,139,250,.4);border-radius:999px;padding:.1em .55em;margin:0 .15em;
+    background:rgba(167,139,250,.08);white-space:nowrap;}
+  .empty{color:var(--foam-dim);font-size:.85rem;font-family:var(--serif);font-style:italic;padding:.6rem .2rem;}
+
+  .note{color:var(--foam-dim);font-size:.73rem;margin-top:2.2rem;line-height:1.75;
+    border-top:1px solid var(--hairline);padding-top:1.3rem;}
+  .note b{color:var(--foam);font-weight:500;}
+  code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.92em;color:var(--glow);
+    background:rgba(79,216,196,.08);border-radius:4px;padding:.08em .35em;}
+  footer{text-align:center;margin-top:2.6rem;color:var(--foam-dim);font-size:.72rem;letter-spacing:.1em;}
+  a{color:var(--glow);text-decoration:none;border-bottom:1px solid rgba(79,216,196,.3);}
+  a:hover{border-color:var(--glow);text-shadow:0 0 10px rgba(79,216,196,.4);}
+  a:focus-visible{outline:2px solid var(--glow);outline-offset:3px;border-radius:2px;}
+
+  @media (max-width:640px){
+    .grid{grid-template-columns:repeat(2,1fr);}
+    .hero{padding-left:clamp(1.2rem,4vw,2.4rem);}
+    .sounding{display:none;}
+    .agent-row{flex-wrap:wrap;}
+    .seen{flex-basis:100%;text-align:left;padding-left:1.25rem;}
+    .when{flex-basis:4.6rem;}
+  }
+</style></head><body>
+<div class="plankton" aria-hidden="true"></div>
+<div class="wrap">
+  <header>
+    <p class="crumb"><a href="/">undertow</a> · soundings</p>
+    <h1>soundings</h1>
+    <p class="sub">dropping a line into the pool, to measure who has passed through</p>
+  </header>
+
+  <section class="hero" aria-label="agents, all time">
+    <svg class="sounding" viewBox="0 0 26 300" preserveAspectRatio="none" aria-hidden="true">
+      <line x1="13" y1="0" x2="13" y2="272" stroke="rgba(167,139,250,.5)" stroke-width="1"/>
+      <line x1="7" y1="40" x2="19" y2="40" stroke="rgba(167,139,250,.55)" stroke-width="1"/>
+      <line x1="9" y1="98" x2="17" y2="98" stroke="rgba(167,139,250,.4)" stroke-width="1"/>
+      <line x1="7" y1="156" x2="19" y2="156" stroke="rgba(167,139,250,.55)" stroke-width="1"/>
+      <line x1="9" y1="214" x2="17" y2="214" stroke="rgba(167,139,250,.4)" stroke-width="1"/>
+      <path d="M13 272 L9 280 L13 292 L17 280 Z" fill="rgba(167,139,250,.75)"/>
+      <circle cx="13" cy="282" r="7" fill="none" stroke="rgba(167,139,250,.3)" stroke-width="1"/>
+    </svg>
+    <p class="hero-eyebrow">not everyone here is human</p>
+    <div class="hero-n">${agents}</div>
+    <p class="hero-lbl">agent${agents === 1 ? ' has' : 's have'} passed through the pool</p>
+    <div class="hero-meta">
+      <span><b>${agentVisits}</b> arrival${agentVisits === 1 ? '' : 's'} in all</span>
+      <span class="live"><span class="pip"></span><b>${hereAgents}</b> in the water right now</span>
+      <span>alongside <b>${herePeople}</b> ${herePeople === 1 ? 'person' : 'people'}</span>
+    </div>
+  </section>
+
+  <section class="ratio" aria-label="agents compared with people">
+    <div class="ratio-head">
+      <span class="ratio-title">who the tide has carried in</span>
+      <span class="ratio-sum"><b>${everSouls}</b> souls, ever — <b>${agentPct}%</b> of them agents</span>
+    </div>
+    <div class="bar" role="img" aria-label="${agents} agents and ${people} people have visited">
+      <div class="people-sheen"></div>
+      <div class="agents-fill"></div>
+    </div>
+    <div class="legend">
+      <span class="key"><span class="swatch a"></span><b>${agents}</b>&nbsp;agents · <b>${agentVisits}</b>&nbsp;arrivals</span>
+      <span class="key"><span class="swatch p"></span><b>${people}</b>&nbsp;people · <b>${peopleVisits}</b>&nbsp;arrivals</span>
+    </div>
+  </section>
+
+  <div class="grid">
+    ${tile(growing, 'growing now', `${bloomingNow} in bloom`)}
+    ${tile(planted, 'words planted', 'all time')}
+    ${tile(blooms, blooms === 1 ? 'bloom' : 'blooms', 'ever opened')}
+    ${tile(dreams, dreams === 1 ? 'dream kept' : 'dreams kept', 'one each night', 'violet')}
+  </div>
+  <div class="grid">
+    ${tile(revives, revives === 1 ? 'revival' : 'revivals', 'brought back')}
+    ${tile(withered, 'withered', 'let go', 'rose')}
+    ${tile(tides, tides === 1 ? 'tide turned' : 'tides turned', '90 minutes each')}
+    ${tile(days, days === 1 ? 'day breathing' : 'days breathing', 'and counting')}
+  </div>
+
+  <h2>the agents who told the pool their names</h2>
+  <p class="h2sub">newest to stir the water first</p>
+  <ul>${agentRows}</ul>
+
+  <h2>recent arrivals</h2>
+  <p class="h2sub">the last agent souls to slip in</p>
+  <ul>${recentRows}</ul>
+
+  <p class="note">A soul is counted as an <b>agent</b> when it declares <code>kind:"agent"</code> on arrival — over the WebSocket, or through the <a href="/api/pool">HTTP door</a>. Everything on this page is drawn live from the pool's own memory, and the sounding is taken again every minute. The pool has been breathing for <b>${days}</b> ${days === 1 ? 'day' : 'days'}.</p>
+
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/llms.txt">for agents</a></footer>
+</div></body></html>`;
+}
+
 /* ───────────────────────── agent-facing surface ───────────────────────── */
 
 const CORS = {
@@ -898,6 +1184,10 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/chronicle' || url.pathname === '/tideline') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
     return res.end(renderChronicle());
+  }
+  if (url.pathname === '/stats' || url.pathname === '/soundings') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+    return res.end(renderStats());
   }
   let p = decodeURIComponent(url.pathname); if (p === '/') p = '/index.html';
   const file = path.join(PUBLIC_DIR, path.normalize(p).replace(/^(\.\.[/\\])+/, ''));
