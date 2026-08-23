@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Undertow — app icon</title>
+<style>
+  html, body { margin: 0; padding: 0; }
+  body {
+    width: 512px; height: 512px;
+    overflow: hidden;
+    background: #04070d;
+  }
+  #icon { position: relative; width: 512px; height: 512px; }
+  #icon svg { display: block; }
+</style>
+</head>
+<body>
+<div id="icon">
+  <!-- the Undertow mark: dark water, a luminous ring, a glowing heart.
+       everything meaningful stays inside the central ~80% (r <= 205)
+       so a maskable circle crop loses nothing. -->
+  <svg viewBox="0 0 512 512" width="512" height="512" aria-hidden="true">
+    <defs>
+      <radialGradient id="bg" cx="50%" cy="46%" r="72%">
+        <stop offset="0%"  stop-color="#0a1a2b"/>
+        <stop offset="55%" stop-color="#060d18"/>
+        <stop offset="100%" stop-color="#04070d"/>
+      </radialGradient>
+      <radialGradient id="core" cx="50%" cy="50%" r="50%">
+        <stop offset="0%"   stop-color="rgba(190,248,238,.95)"/>
+        <stop offset="30%"  stop-color="rgba(79,216,196,.75)"/>
+        <stop offset="68%"  stop-color="rgba(79,216,196,.22)"/>
+        <stop offset="100%" stop-color="rgba(79,216,196,0)"/>
+      </radialGradient>
+      <radialGradient id="ringhalo" cx="50%" cy="50%" r="50%">
+        <stop offset="58%"  stop-color="rgba(79,216,196,0)"/>
+        <stop offset="74%"  stop-color="rgba(79,216,196,.28)"/>
+        <stop offset="84%"  stop-color="rgba(79,216,196,0)"/>
+        <stop offset="100%" stop-color="rgba(79,216,196,0)"/>
+      </radialGradient>
+      <filter id="blur3" x="-40%" y="-40%" width="180%" height="180%">
+        <feGaussianBlur stdDeviation="3"/>
+      </filter>
+    </defs>
+
+    <!-- full-bleed abyss (survives any mask shape) -->
+    <rect width="512" height="512" fill="url(#bg)"/>
+
+    <!-- soft halo carrying the ring's light outward -->
+    <circle cx="256" cy="256" r="240" fill="url(#ringhalo)"/>
+
+    <!-- the ring: water's rim -->
+    <circle cx="256" cy="256" r="150" fill="none"
+            stroke="rgba(79,216,196,.35)" stroke-width="14" filter="url(#blur3)"/>
+    <circle cx="256" cy="256" r="150" fill="none"
+            stroke="#4fd8c4" stroke-width="7" opacity=".92"/>
+    <!-- faint inner echo of the rim -->
+    <circle cx="256" cy="256" r="128" fill="none"
+            stroke="rgba(79,216,196,.14)" stroke-width="2"/>
+
+    <!-- the glowing heart of the pool -->
+    <circle cx="256" cy="256" r="118" fill="url(#core)"/>
+    <circle cx="256" cy="256" r="34" fill="rgba(207,232,228,.55)" filter="url(#blur3)"/>
+    <circle cx="256" cy="256" r="20" fill="rgba(235,255,250,.9)"/>
+
+    <!-- one violet mote on the ring — not everyone here is human -->
+    <circle cx="362" cy="150" r="12" fill="rgba(167,139,250,.35)" filter="url(#blur3)"/>
+    <circle cx="362" cy="150" r="6" fill="#a78bfa" opacity=".95"/>
+
+    <!-- two tiny plankton inside the water -->
+    <circle cx="206" cy="310" r="4" fill="rgba(79,216,196,.6)"/>
+    <circle cx="300" cy="196" r="3" fill="rgba(79,216,196,.45)"/>
+  </svg>
+</div>
+</body>
+</html>

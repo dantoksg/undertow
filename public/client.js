@@ -18,6 +18,17 @@ const NOTE_FREQ = [146.83, 174.61, 196.00, 220.00, 261.63, 293.66, 349.23, 392.0
 const NOTE_HUE  = [172, 197, 224, 258, 292, 326, 18, 44];
 const STAGE_NAME = ['a seed', 'a sprout', 'a frond', 'in bloom', 'withering', 'a husk'];
 
+// stillness, if the visitor asked for it
+const REDUCED_MOTION = !!(window.matchMedia &&
+  window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+
+// small screens / low-power devices: keep the pool full, just lighter
+const LOW_POWER =
+  Math.min(window.innerWidth, window.innerHeight) < 700 ||
+  (navigator.hardwareConcurrency || 4) <= 4;
+const MOTE_CAP = LOW_POWER ? 130 : 260;
+const TRAIL_LEN = LOW_POWER ? 8 : 14;
+
 const DEFAULT_WORLD = {
   w: 1600, h: 1000, cx: 800, cy: 500, rx: 760, ry: 460,
   tidePeriod: 5400000, epoch: 1700000000000,
@@ -217,6 +228,28 @@ function playPulse(x, quiet) {
   o.connect(g); o.start(t); o.stop(t + 1.5);
 }
 
+function playBloomBell(x, hue) {
+  // a single gentle bell for a plant reaching bloom — one pentatonic tone,
+  // chosen by the plant's own hue, panned to where it grows
+  if (!A.ctx || !S.soundOn) return;
+  const t = A.ctx.currentTime;
+  const f = NOTE_FREQ[Math.round(((hue % 360) + 360) / 45) % 8] * 4;
+  const g = A.ctx.createGain();
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.055, t + 0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + 3.6);
+  const p = A.ctx.createStereoPanner ? A.ctx.createStereoPanner() : null;
+  if (p) { p.pan.value = pan(x); g.connect(p); p.connect(A.master); }
+  else g.connect(A.master);
+  const o = A.ctx.createOscillator();
+  o.type = 'sine'; o.frequency.value = f;
+  const o2 = A.ctx.createOscillator();          // faintly inharmonic shimmer
+  o2.type = 'sine'; o2.frequency.value = f * 2.01;
+  const g2 = A.ctx.createGain(); g2.gain.value = 0.35;
+  o.connect(g); o2.connect(g2); g2.connect(g);
+  o.start(t); o2.start(t); o.stop(t + 3.8); o2.stop(t + 3.8);
+}
+
 function playChime() { // growth / arrival sparkle
   if (!A.ctx || !S.soundOn) return;
   const t = A.ctx.currentTime;
@@ -375,7 +408,7 @@ function onEvent(ev) {
     case 'grow': {
       const f = S.flora.get(ev.id);
       if (f) { f.stage = ev.stage; f.growFlash = performance.now();
-               if (ev.stage === 3) { spawnRipple(f.x, f.y, f.hue, 1); playChime(); } }
+               if (ev.stage === 3) { spawnBloom(f.x, f.y, f.hue); playBloomBell(f.x, f.hue); } }
       break;
     }
     case 'wither': { const f = S.flora.get(ev.id); if (f) f.stage = 4; break; }
@@ -384,7 +417,8 @@ function onEvent(ev) {
     case 'revive': {
       const f = S.flora.get(ev.id);
       if (f) { f.stage = ev.stage; f.growFlash = performance.now();
-               spawnRipple(f.x, f.y, f.hue, 1); playChime(); }
+               if (ev.stage === 3) { spawnBloom(f.x, f.y, f.hue); playBloomBell(f.x, f.hue); }
+               else { spawnRipple(f.x, f.y, f.hue, 1); playChime(); } }
       break;
     }
     case 'tend': {
@@ -475,7 +509,9 @@ function simStep() {
 
 function spawnMotes() {
   S.motes = [];
-  const n = Math.min(170, Math.floor((cam.W * cam.H) / 7000));
+  const n = LOW_POWER
+    ? Math.min(90, Math.floor((cam.W * cam.H) / 13000))
+    : Math.min(170, Math.floor((cam.W * cam.H) / 7000));
   for (let i = 0; i < n; i++) {
     const a = Math.random() * TAU, r = Math.sqrt(Math.random());
     S.motes.push({
@@ -514,6 +550,28 @@ function spawnSong(x, y, note, hue) {
 function spawnRipple(x, y, hue, power) {
   S.effects.push({ kind: 'ripple', x, y, hue, t0: performance.now(), life: 1400 + power * 800 });
   exciteMotes(x, y, power * 0.5);
+}
+function spawnBloom(x, y, hue) {
+  // a plant has reached bloom — a shared flourish everyone sees together,
+  // driven by the server's grow event, never faked locally
+  const spores = [];
+  if (!REDUCED_MOTION) {
+    const n = LOW_POWER ? 4 : 7;
+    for (let i = 0; i < n; i++) {
+      spores.push({
+        dx: (Math.random() - 0.5) * 70,
+        rise: 60 + Math.random() * 70,
+        delay: Math.random() * 0.35,
+        sz: 1.2 + Math.random() * 1.6,
+      });
+    }
+    exciteMotes(x, y, 0.7);
+  }
+  S.effects.push({
+    kind: 'bloom', x, y, hue, spores,
+    t0: performance.now(),
+    life: REDUCED_MOTION ? 1100 : 1600,
+  });
 }
 
 /* ── actions ───────────────────────────────────────────────────────────── */
@@ -875,7 +933,7 @@ function pushTrail(d) {
   const last = d.trail[d.trail.length - 1];
   if (!last || dist(last[0], last[1], d.x, d.y) > 6) {
     d.trail.push([d.x, d.y]);
-    if (d.trail.length > 14) d.trail.shift();
+    if (d.trail.length > TRAIL_LEN) d.trail.shift();
   }
 }
 
@@ -960,7 +1018,7 @@ function drawCaustics(pn, tide) {
   ctx.save();
   ctx.globalCompositeOperation = 'lighter';
   const w = S.world;
-  const n = 4;
+  const n = LOW_POWER ? 2 : 4;
   for (let i = 0; i < n; i++) {
     const ph = pn * 0.00006 * (i % 2 ? 1 : -1) + i * 2.1;
     const x = w.cx + Math.cos(ph) * w.rx * 0.5;
@@ -982,11 +1040,13 @@ function drawSurface(pn, tide) {
   ctx.globalCompositeOperation = 'lighter';
   const w = S.world;
   ctx.lineWidth = 1;
-  for (let i = 0; i < 5; i++) {
+  const lines = LOW_POWER ? 3 : 5;
+  const step = LOW_POWER ? 60 : 40;
+  for (let i = 0; i < lines; i++) {
     const yy = w.cy - w.ry * (0.75 - i * 0.09);
     ctx.strokeStyle = `hsla(190, 60%, 70%, ${0.02 + tide * 0.025})`;
     ctx.beginPath();
-    for (let x = w.cx - w.rx; x <= w.cx + w.rx; x += 40) {
+    for (let x = w.cx - w.rx; x <= w.cx + w.rx; x += step) {
       const y = yy + Math.sin(x * 0.006 + pn * 0.0004 + i * 1.7) * 9
                    + Math.sin(x * 0.013 - pn * 0.0007) * 4;
       if (x === w.cx - w.rx) ctx.moveTo(w2sX(x), w2sY(y));
@@ -1133,7 +1193,8 @@ function drawPlant(f, pn, current) {
   }
 
   // bloom sheds spores
-  if (f.stage === 3 && Math.random() < 0.008 && S.motes.length < 260) {
+  if (f.stage === 3 && Math.random() < (LOW_POWER ? 0.004 : 0.008) &&
+      S.motes.length < MOTE_CAP) {
     S.motes.push({
       x: f.x, y: f.y - heights[3], vx: (Math.random() - 0.5) * 3, vy: -1.5,
       tw: Math.random() * TAU, sz: 0.9, hue,
@@ -1201,6 +1262,30 @@ function drawEffects(pn) {
       const gy = y - k * 90 * cam.s;
       ctx.fillStyle = `hsla(${e.hue}, 90%, 75%, ${0.7 * (1 - k)})`;
       ctx.beginPath(); ctx.arc(x, gy, 3.2 * cam.s, 0, TAU); ctx.fill();
+    } else if (e.kind === 'bloom') {
+      // a bloom moment: soft light unfolding, a petal ring, spores rising
+      const ease = 1 - Math.pow(1 - k, 3);
+      const R = (REDUCED_MOTION ? 70 : 40 + ease * 170) * cam.s;
+      const a = 0.5 * (1 - k);
+      const bg = ctx.createRadialGradient(x, y, 0, x, y, R);
+      bg.addColorStop(0, `hsla(${e.hue}, 85%, 72%, ${a * 0.55})`);
+      bg.addColorStop(0.6, `hsla(${e.hue}, 85%, 65%, ${a * 0.18})`);
+      bg.addColorStop(1, `hsla(${e.hue}, 85%, 65%, 0)`);
+      ctx.fillStyle = bg;
+      ctx.beginPath(); ctx.arc(x, y, R, 0, TAU); ctx.fill();
+      if (!REDUCED_MOTION) {
+        ctx.strokeStyle = `hsla(${e.hue}, 90%, 75%, ${a * 0.8})`;
+        ctx.lineWidth = Math.max(1, (1 - k) * 2);
+        ctx.beginPath(); ctx.ellipse(x, y, R * 0.75, R * 0.55, 0, 0, TAU); ctx.stroke();
+        for (const sp of e.spores) {
+          const kk = clamp((k - sp.delay) / (1 - sp.delay), 0, 1);
+          if (kk <= 0) continue;
+          const sx = x + sp.dx * kk * cam.s;
+          const sy = y - sp.rise * (1 - Math.pow(1 - kk, 2)) * cam.s;
+          ctx.fillStyle = `hsla(${e.hue}, 90%, 80%, ${0.8 * (1 - kk)})`;
+          ctx.beginPath(); ctx.arc(sx, sy, sp.sz * cam.s, 0, TAU); ctx.fill();
+        }
+      }
     }
   }
   ctx.restore();
