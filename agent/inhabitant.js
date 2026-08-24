@@ -79,12 +79,12 @@ const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 const rand = (a, b) => a + Math.random() * (b - a);
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-const ws = new WebSocket(URL);
-const send = (o) => ws.readyState === 1 && ws.send(JSON.stringify(o));
+let ws;
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
 
-ws.on('open', () => send({ t: 'hello', soul: SOUL, name: NAME, hue: HUE, kind: 'agent' }));
+function onOpen() { send({ t: 'hello', soul: SOUL, name: NAME, hue: HUE, kind: 'agent' }); }
 
-ws.on('message', (buf) => {
+function onMessage(buf) {
   let m; try { m = JSON.parse(buf); } catch { return; }
 
   if (m.t === 'welcome') {
@@ -125,7 +125,7 @@ ws.on('message', (buf) => {
     }
   }
   world.floraCount = [...world.flora.values()].filter(f => f.stage < 5).length;
-});
+}
 
 /* ── policy ────────────────────────────────────────────────────────────── */
 
@@ -279,5 +279,17 @@ if (MIND === 'llm' && OLLAMA_KEY) {
 setInterval(decide, C.decideMs);
 setInterval(() => send({ t: 'ping' }), 25_000);
 
-ws.on('close', () => { console.log(`${TAG} swept out of the pool`); process.exit(0); });
-ws.on('error', (e) => { console.error(`${TAG} unreachable:`, e.message); process.exit(1); });
+// Reconnect instead of exiting, so a server redeploy doesn't empty the pool.
+let reconnectTimer = null;
+function scheduleReconnect() {
+  if (reconnectTimer) return;
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 2000 + Math.random() * 3000);
+}
+function connect() {
+  ws = new WebSocket(URL);
+  ws.on('open', onOpen);
+  ws.on('message', onMessage);
+  ws.on('close', () => { console.log(`${TAG} swept out — drifting back soon`); scheduleReconnect(); });
+  ws.on('error', (e) => { console.error(`${TAG} unreachable:`, e.message); try { ws.close(); } catch {} scheduleReconnect(); });
+}
+connect();
