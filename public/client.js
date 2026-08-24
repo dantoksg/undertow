@@ -64,7 +64,14 @@ const S = {
   nextDreamAt: 0,
   records: { chorus: 3 },           // the greatest chorus the pool has heard
   lastJoinHintAt: 0,
+  clockSkew: 0,                     // serverNow - Date.now(), so tide math holds on wrong clocks
+  gatherOpen: false,                // is the high-water gathering window open?
+  nextGatherPulseAt: 0,             // when the water next swells during a gathering
 };
+
+// the gathering window around each high water (mirrors the server)
+const GATHER_OPEN_MS = 4 * 60000;
+const GATHER_CLOSE_MS = 2 * 60000;
 
 /* ── dom ───────────────────────────────────────────────────────────────── */
 
@@ -81,6 +88,7 @@ const el = {
   nameSkip: $('name-skip'), hint: $('hint'), offline: $('offline'), hud2: $('hud2'),
   actPulse: $('act-pulse'), actSing: $('act-sing'), actPlant: $('act-plant'),
   actSound: $('act-sound'), icOn: $('ic-sound-on'), icOff: $('ic-sound-off'),
+  actCall: $('act-call'),
 };
 
 /* ── tiny utils ────────────────────────────────────────────────────────── */
@@ -117,6 +125,25 @@ function tideNow() {
   return { tide: 0.5 + 0.5 * Math.sin(TAU * ph), phase: ph,
            rising: Math.cos(TAU * ph) > 0,
            current: 22 * Math.cos(TAU * ph) };
+}
+
+/* high water crests at tide phase 0.25 — around each crest the pool gathers.
+   Computed on the server's clock (skew-corrected) so the countdown is honest. */
+function gatherNow() {
+  const w = S.world;
+  const t = Date.now() + (S.clockSkew || 0);
+  const ph = ((((t - w.epoch) % w.tidePeriod) + w.tidePeriod) % w.tidePeriod) / w.tidePeriod;
+  const next = t + ((0.25 - ph + 1) % 1) * w.tidePeriod;   // next crest, >= t
+  const prev = next - w.tidePeriod;                         // last crest, < t
+  const afterPrev = t - prev <= GATHER_CLOSE_MS;
+  const open = afterPrev || next - t <= GATHER_OPEN_MS;
+  return { t, next, prev, open, high: afterPrev ? prev : next };
+}
+
+function fmtToHigh(ms) {
+  if (ms <= 0) return 'now';
+  if (ms < 95000) return `${Math.max(1, Math.round(ms / 1000))}s`;
+  return `${Math.round(ms / 60000)} min`;
 }
 
 function agoText(ms) {
@@ -408,6 +435,7 @@ function onWelcome(m) {
   S.soulsEver = m.souls?.ever ?? null;
 
   if (m.records && typeof m.records.chorus === 'number') S.records.chorus = m.records.chorus;
+  if (m.gathering && typeof m.gathering.now === 'number') S.clockSkew = m.gathering.now - Date.now();
 
   // keep last night's dream — the water will murmur it, a line at a time
   S.dreamLines = (m.dream || []).filter(Boolean);
@@ -422,6 +450,7 @@ function onWelcome(m) {
 
 function onTick(m) {
   S.tide = m.tide ?? S.tide;
+  if (typeof m.now === 'number') S.clockSkew = m.now - Date.now();
   const seen = new Set();
   for (const [id, x, y] of m.d || []) {
     seen.add(id);
@@ -513,10 +542,13 @@ function onEvent(ev) {
       // three or more voices found each other — the whole pool sings back
       spawnChorus(ev.x, ev.y, ev.count);
       playChord(ev.note ?? 0, ev.x);
+      if (ev.tidal) spawnRipple(ev.x, ev.y, 172, 1.6);   // sung at the crest — a tidal ring
       const rec = S.records.chorus || 3;
-      flashHint((ev.count || 3) >= rec
-        ? `${ev.count || 3} voices — the pool sings back`
-        : `${ev.count || 3} voices — the greatest was ${rec}. gather more.`);
+      flashHint(ev.tidal
+        ? `a tidal chorus — ${ev.count || 3} voices at high water`
+        : (ev.count || 3) >= rec
+          ? `${ev.count || 3} voices — the pool sings back`
+          : `${ev.count || 3} voices — the greatest was ${rec}. gather more.`);
       break;
     }
     case 'grand': {
@@ -524,8 +556,16 @@ function onEvent(ev) {
       if (typeof ev.count === 'number') S.records.chorus = ev.count;
       spawnGrand(ev.x, ev.y, ev.count, ev.names || []);
       playGrand(ev.note ?? 0, ev.x ?? S.world.cx);
-      flashHint('the pool will remember this');
+      flashHint(ev.tidal
+        ? 'a tidal great chorus — sung as the tide stood at its full. the pool will remember this'
+        : 'the pool will remember this');
       updateHud();
+      break;
+    }
+    case 'gather': {
+      // the high-water gathering window, called by the server itself —
+      // local math paints the countdown; this keeps everyone in step
+      setGather(!!ev.open, ev.need);
       break;
     }
     case 'communal': {
@@ -555,6 +595,37 @@ function nudgeSelf(px, py) {
   const ux = dx / d, uy = dy / d;
   [S.me.x, S.me.y] = clampToPool(S.me.x + ux * mag * 0.45, S.me.y + uy * mag * 0.45);
   [S.me.tx, S.me.ty] = clampToPool(S.me.tx + ux * mag, S.me.ty + uy * mag);
+}
+
+/* ── the high-water gathering ──────────────────────────────────────────────
+   Around every crest of the tide the pool gathers: the rim brightens, slow
+   rings breathe out from the deep, and the HUD calls everyone to sing.
+   The state is computed locally each frame (skew-corrected) and confirmed
+   by the server's 'gather' event, so open/close never fires twice.        */
+
+function setGather(open, need) {
+  if (open === S.gatherOpen) return;
+  S.gatherOpen = open;
+  if (open) {
+    const n = need || (S.records.chorus || 3) + 1;
+    flashHint(`high water — the pool is gathering. ${n} voices in one breath makes history`);
+    playChime();
+    spawnRipple(S.world.cx, S.world.cy, 172, 1.5);
+    S.nextGatherPulseAt = performance.now() + 7000;
+  }
+  updateHud();
+}
+
+function updateGather() {
+  if (!S.connected || S.sim) { S.gatherOpen = false; return; }
+  setGather(gatherNow().open);
+  if (S.gatherOpen && !REDUCED_MOTION) {
+    const pn = performance.now();
+    if (pn >= (S.nextGatherPulseAt || 0)) {
+      S.nextGatherPulseAt = pn + (LOW_POWER ? 14000 : 9000);
+      spawnRipple(S.world.cx, S.world.cy, 172, 1.2);   // a slow swell from the deep
+    }
+  }
 }
 
 function addDrifter(d) {
@@ -893,6 +964,55 @@ function actTend(id) {
   hideCard();
 }
 
+/* ── calling others to the water ───────────────────────────────────────────
+   The bell: one tap composes a live rally — how long until the tide gathers,
+   how many voices history asks for — and hands it to whoever should hear it.
+   Ringing it is felt in the water too, so it never feels like leaving.     */
+
+function rallyMessage() {
+  const need = (S.records.chorus || 3) + 1;
+  const link = 'https://undertow.drwifi.nz';
+  if (!S.connected || S.sim) {
+    return `there is a quiet pool where the tide gathers every 90 minutes — ${link}`;
+  }
+  const g = gatherNow();
+  if (g.open) return `high water in the pool — right now. ${need} voices in one breath makes history: ${link}`;
+  return `the tide gathers in ${fmtToHigh(g.next - g.t)} — ${need} voices in one breath to make history: ${link}`;
+}
+
+function legacyCopy(text) {
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch { return false; }
+}
+
+async function actCall() {
+  const msg = rallyMessage();
+  // ringing the bell is felt here first — a ripple from where you drift
+  if (S.me) spawnRipple(S.me.x, S.me.y, S.me.hue, 1);
+  playChime();
+  const mobile = /Mobi|Android|iPhone|iPad/.test(navigator.userAgent);
+  if (mobile && navigator.share) {
+    try { await navigator.share({ text: msg }); flashHint('the call is ringing'); return; }
+    catch (e) { if (e && e.name === 'AbortError') return; }
+  }
+  try {
+    await navigator.clipboard.writeText(msg);
+    flashHint('the call is copied — ring it where your people are');
+  } catch {
+    flashHint(legacyCopy(msg)
+      ? 'the call is copied — ring it where your people are'
+      : 'the water is at undertow.drwifi.nz — pass it on');
+  }
+}
+
 /* ── input ─────────────────────────────────────────────────────────────── */
 
 let pressTimer = null;
@@ -965,6 +1085,8 @@ window.addEventListener('keydown', (e) => {
 /* ── ui: dock, notefan, plantbox, card, name ───────────────────────────── */
 
 el.actPulse.addEventListener('click', () => { audioInit(); actPulse(); });
+
+if (el.actCall) el.actCall.addEventListener('click', () => { audioInit(); actCall(); });
 
 el.actSing.addEventListener('click', () => {
   audioInit();
@@ -1096,10 +1218,16 @@ setTimeout(() => { if (!S.hintsSeen.move) flashHint('touch the water, and drift'
 function updateHud() {
   const { rising } = tideNow();
   const t = S.tide;
+  const g = (S.connected && !S.sim) ? gatherNow() : null;
   let tideText;
   if (t > 0.85) tideText = 'high water';
   else if (t < 0.15) tideText = 'low water';
   else tideText = rising ? 'the tide is rising' : 'the tide is going out';
+  if (g) {
+    // the appointment, always visible: when the water next gathers
+    if (g.open) tideText = 'high water — the pool gathers';
+    else tideText += ` · high water in ${fmtToHigh(g.next - g.t)}`;
+  }
   el.hudTide.textContent = tideText;
 
   const here = S.drifters.size + (S.me ? 1 : 0);
@@ -1111,19 +1239,31 @@ function updateHud() {
   if (S.soulsEver != null) s += ` · ${S.soulsEver} have passed through`;
   el.hudSouls.textContent = s;
 
-  // the standing dare: the greatest chorus, and whether this room could best it
+  // the standing dare: the greatest chorus, and whether this room could best it —
+  // and, over everything, the gathering: high water is the appointed hour
   if (el.hud2) {
     if (S.sim || !S.connected) {
       el.hud2.textContent = '';
-      el.hud2.classList.remove('call');
+      el.hud2.classList.remove('call', 'tide');
     } else {
       const rec = S.records.chorus || 3;
-      if (here > rec) {
-        el.hud2.textContent = `${here} souls are here — ${rec + 1} voices at once would be the greatest chorus ever heard`;
+      const need = rec + 1;
+      if (g && g.open) {
+        el.hud2.textContent = here >= need
+          ? `high water — ${here} souls are here. ${need} voices in one breath, now, and history is made`
+          : `high water — the pool gathers. ${need} voices in one breath would make history · ring the bell`;
+        el.hud2.classList.add('call', 'tide');
+      } else if (g && g.next - g.t <= 600000) {
+        el.hud2.textContent = `the tide gathers in ${fmtToHigh(g.next - g.t)} — be here with ${need} voices, and make history`;
+        el.hud2.classList.toggle('call', here > rec);
+        el.hud2.classList.remove('tide');
+      } else if (here > rec) {
+        el.hud2.textContent = `${here} souls are here — ${need} voices at once would be the greatest chorus ever heard`;
         el.hud2.classList.add('call');
+        el.hud2.classList.remove('tide');
       } else {
         el.hud2.textContent = `the greatest chorus the pool has heard — ${rec} voices`;
-        el.hud2.classList.remove('call');
+        el.hud2.classList.remove('call', 'tide');
       }
     }
   }
@@ -1289,7 +1429,7 @@ function draw(pn) {
 
   ctx.restore();
 
-  drawRim(t);
+  drawRim(t, pn);
   drawVignette();
 }
 
@@ -1336,16 +1476,19 @@ function drawSurface(pn, tide) {
   ctx.restore();
 }
 
-function drawRim(tide) {
+function drawRim(tide, pn) {
   const w = S.world;
   ctx.save();
-  // rim glow ring — water meets stone
+  // rim glow ring — water meets stone; while the pool gathers, it breathes
+  const gth = S.gatherOpen
+    ? 0.08 + (REDUCED_MOTION ? 0 : 0.05 * Math.sin((pn || 0) * 0.0016))
+    : 0;
   ctx.beginPath();
   ctx.ellipse(w2sX(w.cx), w2sY(w.cy), w.rx * cam.s, w.ry * cam.s, 0, 0, TAU);
-  ctx.strokeStyle = `hsla(190, 60%, 60%, ${0.10 + tide * 0.12})`;
+  ctx.strokeStyle = `hsla(190, 60%, 60%, ${0.10 + tide * 0.12 + gth})`;
   ctx.lineWidth = 2;
   ctx.shadowColor = 'hsla(185, 80%, 60%, 0.5)';
-  ctx.shadowBlur = 18 * cam.s;
+  ctx.shadowBlur = (18 + gth * 60) * cam.s;
   ctx.stroke();
   ctx.shadowBlur = 0;
   // stones
@@ -1851,6 +1994,7 @@ function frame(pn) {
 
   if (S.sim) S.tide = tideNow().tide;
   stepLocal(dt);
+  updateGather();
   maybeSurfaceDream(pn);
   draw(pn);
 

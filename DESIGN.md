@@ -236,6 +236,25 @@ planter names afterward — or simpler: server may include `soulTag`, a stable
 8-char hash of the planter's soul, on every flora object, and `you.soulTag` in
 welcome, so clients can mark ownership without exposing tokens. **Do this.**)
 
+### High-water gatherings (additive layer)
+
+The tide crests at phase **0.25**. From `GATHER_OPEN_MS` (4 min) before each
+crest until `GATHER_CLOSE_MS` (2 min) after it, the pool holds a **gathering**:
+a standing ~90-minute appointment computed from the sacred epoch, never stored.
+
+- `welcome`, `/api/pool`, and `/health` carry an additive field
+  `gathering: { now, high, next, open, opensAt, closesAt }` — ms timestamps on
+  the server clock (`now` lets clients correct skew; `tick.now` refines it).
+- New additive `ev` kinds: `{ e:"gather", open:true, hw, closesAt, need }` when
+  the window opens, `{ e:"gather", open:false, next }` when it closes.
+- A chorus/grand fired while the window is open carries `tidal: true`
+  (additive key on the existing events); a tidal grand's `moments.line` reads
+  "…as the tide stood at its full…". Nothing about the record, anti-cheat, or
+  existing event shapes changes.
+- The client mirrors the crest math locally (skew-corrected), shows a live
+  countdown in the HUD, turns `#hud2` into the gathering call near/at high
+  water, and has a dock **call** bell that copies/shares a live rally message.
+
 ---
 
 ## Persistence (SQLite, better-sqlite3, WAL mode, file `/data/undertow.db`)

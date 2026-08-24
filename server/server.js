@@ -168,6 +168,32 @@ function tideValue(t = now()) { return 0.5 + 0.5 * Math.sin(2 * Math.PI * tidePh
 function tideRising(t = now()) { const p = tidePhase(t); return p >= 0.75 || p < 0.25; }
 function currentX(t = now()) { return CURRENT_MAX * Math.cos(2 * Math.PI * tidePhase(t)); }
 
+/* ── high-water gatherings ──────────────────────────────────────────────────
+   The tide crests at phase 0.25 (the sine's peak). Around each crest the pool
+   opens a GATHERING window — a standing ~90-minute appointment that needs no
+   scheduler, because the tide IS the schedule. Everyone present is called to
+   sing together and chase the chorus record; a chorus sung inside the window
+   is a TIDAL chorus, and the pool celebrates it a little extra.            */
+
+const GATHER_OPEN_MS = 4 * 60_000;    // the window opens this long before high water
+const GATHER_CLOSE_MS = 2 * 60_000;   // and lingers this long after the crest
+
+function gatherInfo(t = now()) {
+  const ph = tidePhase(t);
+  const next = t + ((0.25 - ph + 1) % 1) * TIDE_PERIOD_MS;  // next crest, >= t
+  const prev = next - TIDE_PERIOD_MS;                        // last crest, < t
+  const afterPrev = t - prev <= GATHER_CLOSE_MS;
+  const open = afterPrev || next - t <= GATHER_OPEN_MS;
+  const high = afterPrev ? prev : next;                      // the crest this window belongs to
+  return { next, prev, high, open, opensAt: high - GATHER_OPEN_MS, closesAt: high + GATHER_CLOSE_MS };
+}
+
+// The additive public shape carried on welcome / tick-adjacent snapshots.
+function gatherPublic(t = now()) {
+  const g = gatherInfo(t);
+  return { now: t, high: g.high, next: g.next, open: g.open, opensAt: g.opensAt, closesAt: g.closesAt };
+}
+
 function clampEllipse(x, y) {
   let nx = (x - WORLD.cx) / WORLD.rx, ny = (y - WORLD.cy) / WORLD.ry;
   const r = Math.hypot(nx, ny);
@@ -266,13 +292,18 @@ function buildWhisper(soul) {
   return out;
 }
 
-function firstWhisper() {
+const ordSuffix = (n) => { const v = n % 100; if (v >= 11 && v <= 13) return 'th'; switch (n % 10) { case 1: return 'st'; case 2: return 'nd'; case 3: return 'rd'; default: return 'th'; } };
+
+function firstWhisper(ordinal) {
   const days = Math.max(1, Math.floor((now() - epoch) / 86_400_000));
-  return [
+  const lines = [
     `This pool was here before you. It has been breathing for ${days} ${days === 1 ? 'day' : 'days'}.`,
     'Others pass through — not all of them human.',
     'Leave one small thing, and the water will speak of you.',
   ];
+  // a small fact worth carrying out of the water: which soul you are
+  if (ordinal && ordinal > 1) lines.splice(1, 0, `You are the ${ordinal}${ordSuffix(ordinal)} soul it has known.`);
+  return lines.slice(0, 4);
 }
 
 function buildChronicle() {
@@ -397,7 +428,7 @@ function handleHello(ws, m) {
     const rec = { id, tag: tagOf(id), name, hue, kind, first_seen: now(), last_seen: now() };
     Q.insSoul.run(rec);
     soul = Q.soulById.get(id);
-    whisper = firstWhisper();
+    whisper = firstWhisper(Q.everCount.get().n);
   }
   logEvent('visit', soul.id, null, { name: soul.name, kind: soul.kind });
 
@@ -423,6 +454,7 @@ function handleHello(ws, m) {
     dream: (Q.latestDream.get()?.text || '').split('\n').filter(Boolean),
     souls: { here: driftersHere(), ever: Q.everCount.get().n },
     records: { chorus: chorusRecord, at: chorusRecordAt || null },
+    gathering: gatherPublic(),
   });
 
   // Announce to everyone else after their snapshot exists.
@@ -474,12 +506,13 @@ function fireChorus(t) {
   const g = chorusGather; chorusGather = null;
   if (!g) return;
   lastChorusAt = t;
+  const tidal = gatherInfo(t).open;   // sung while the tide stood at its full
   const voices = [...g.voices.values()];
   let cx = 0, cy = 0;
   for (const v of voices) { cx += v.x; cy += v.y; }
   cx = Math.round(cx / voices.length); cy = Math.round(cy / voices.length);
-  pending.push({ e: 'chorus', note: g.note, x: cx, y: cy, count: voices.length });
-  logEvent('chorus', null, null, { count: voices.length });
+  pending.push({ e: 'chorus', note: g.note, x: cx, y: cy, count: voices.length, ...(tidal ? { tidal: true } : {}) });
+  logEvent('chorus', null, null, { count: voices.length, ...(tidal ? { tidal: true } : {}) });
   singWindow.length = 0;
 
   if (voices.length > chorusRecord) {
@@ -489,11 +522,13 @@ function fireChorus(t) {
       setWorld.run('chorus_record', String(chorusRecord));
       setWorld.run('chorus_record_at', String(t));
       const singers = voices.slice(0, 24).map(v => ({ n: v.name || 'a nameless one', k: v.kind }));
-      const line = `${voices.length} voices rose within one breath — the greatest chorus the pool has ever heard.`;
+      const line = tidal
+        ? `${voices.length} voices rose within one breath, as the tide stood at its full — the greatest chorus the pool has ever heard.`
+        : `${voices.length} voices rose within one breath — the greatest chorus the pool has ever heard.`;
       Q.insMoment.run(t, 'grand-chorus', voices.length, JSON.stringify(singers), line);
       const names = singers.slice(0, 16).map(s => s.n);
-      pending.push({ e: 'grand', kind: 'chorus', count: voices.length, names, note: g.note, x: cx, y: cy });
-      logEvent('grand', null, null, { count: voices.length, names: names.slice(0, 12) });
+      pending.push({ e: 'grand', kind: 'chorus', count: voices.length, names, note: g.note, x: cx, y: cy, ...(tidal ? { tidal: true } : {}) });
+      logEvent('grand', null, null, { count: voices.length, names: names.slice(0, 12), ...(tidal ? { tidal: true } : {}) });
       console.log(`[pool] a GREAT chorus — ${voices.length} voices, the most the pool has ever heard`);
     }
   }
@@ -639,7 +674,7 @@ function restJoin(m, ip) {
   } else {
     const id = seed || mintSoul();
     Q.insSoul.run({ id, tag: tagOf(id), name, hue, kind: 'agent', first_seen: now(), last_seen: now() });
-    soul = Q.soulById.get(id); whisper = firstWhisper();
+    soul = Q.soulById.get(id); whisper = firstWhisper(Q.everCount.get().n);
   }
   let d = restDrifters.get(soul.id);
   if (!d) {
@@ -665,6 +700,7 @@ function buildSnapshot(viewerSoul, selfId) {
     chronicle: buildChronicle(),
     souls: { here: driftersHere(), ever: Q.everCount.get().n },
     records: { chorus: chorusRecord, at: chorusRecordAt || null },
+    gathering: gatherPublic(),
   };
 }
 
@@ -684,6 +720,7 @@ setInterval(() => {
 /* ───────────────────────── tick loop (6 Hz) ───────────────────────── */
 
 let lastPhase = tidePhase();
+let gatherOpen = gatherInfo().open;   // is the high-water gathering window open?
 function crossed(a, b, mark) { return a < mark && b >= mark || (b < a && (a < mark || b >= mark)); }
 
 function tick() {
@@ -702,6 +739,15 @@ function tick() {
 
   // a gathered chorus fires once the pool has finished its inhale
   if (chorusGather && t >= chorusGather.fireAt) fireChorus(t);
+
+  // the gathering window around high water opens and closes (new additive ev)
+  const gi = gatherInfo(t);
+  if (gi.open !== gatherOpen) {
+    gatherOpen = gi.open;
+    pending.push(gi.open
+      ? { e: 'gather', open: true, hw: gi.high, closesAt: gi.closesAt, need: chorusRecord + 1 }
+      : { e: 'gather', open: false, next: gi.next });
+  }
 
   // integrate drifters (socket + REST)
   for (const d of allDrifters()) {
@@ -812,8 +858,8 @@ function chronicleLine(r) {
     case 'wither': return `&lsquo;${esc(d.word)}&rsquo; began to wither`;
     case 'husk': return `&lsquo;${esc(d.word)}&rsquo; hardened to a husk`;
     case 'communal': return `&lsquo;${esc(d.word)}&rsquo; was raised by ${d.hands || 'many'} hands`;
-    case 'chorus': return `${d.count || 'several'} voices found each other, and the pool sang back`;
-    case 'grand': return `${d.count || 'many'} voices rose as one — the greatest chorus the pool had ever heard`;
+    case 'chorus': return `${d.count || 'several'} voices found each other${d.tidal ? ' at high water' : ''}, and the pool sang back`;
+    case 'grand': return `${d.count || 'many'} voices rose as one${d.tidal ? ' as the tide stood at its full' : ''} — the greatest chorus the pool had ever heard`;
     case 'dream': return `the pool dreamed`;
     default: return null;
   }
@@ -1277,10 +1323,13 @@ function renderMoments() {
   .dare .how{font-family:var(--sans);font-style:normal;color:var(--foam-dim);font-size:.76rem;
     letter-spacing:.08em;margin-top:.7rem;}
   .dare .how b{color:var(--foam);font-weight:500;}
-  .dare a.go{display:inline-block;margin-top:1rem;color:var(--glow);font-size:.74rem;letter-spacing:.18em;
+  .dare .how b.hw{color:#9be9dd;text-shadow:0 0 12px rgba(79,216,196,.35);}
+  .dare .darerow{display:flex;justify-content:center;gap:.7rem;flex-wrap:wrap;margin-top:1rem;}
+  .dare .go{display:inline-block;font-family:var(--sans);color:var(--glow);font-size:.74rem;letter-spacing:.18em;
     text-transform:lowercase;text-decoration:none;border:1px solid rgba(79,216,196,.4);border-radius:999px;
+    background:transparent;cursor:pointer;
     padding:.45em 1.4em;transition:background .25s,box-shadow .25s;}
-  .dare a.go:hover{background:rgba(79,216,196,.12);box-shadow:0 0 16px rgba(79,216,196,.25);}
+  .dare .go:hover{background:rgba(79,216,196,.12);box-shadow:0 0 16px rgba(79,216,196,.25);}
   h2{font-family:var(--serif);font-weight:300;font-size:1.15rem;letter-spacing:.05em;
     color:var(--foam);margin:2.4rem 0 1rem;opacity:.9;}
   ul{list-style:none;}
@@ -1307,12 +1356,42 @@ function renderMoments() {
     <p>the water is listening for <b>${need}</b> voices in one breath.</p>
     <p class="how">gather ${need} souls in the pool — friends, strangers, the keepers — and sing
     (keys <b>1–8</b>) within a moment of each other. <b>${here}</b> ${here === 1 ? 'soul is' : 'souls are'} in the water right now.</p>
-    <a class="go" href="/">enter the water →</a>
+    <p class="how">the pool gathers at every high water — next in <b class="hw" id="hw">…</b></p>
+    <div class="darerow">
+      <a class="go" href="/">enter the water →</a>
+      <button class="go" id="callbtn" type="button">call others to the water</button>
+    </div>
   </section>
   ${rows ? `<h2>every chorus that made history</h2><ul>${rows}</ul>` : (latest ? '' : `<ul><li><span class="what empty">None yet. The pool has heard choruses of three — history begins at ${need}.</span></li></ul>`)}
   <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/stats">its census</a><br><br>
     <span style="opacity:.7">the pool has been breathing for ${days} ${days === 1 ? 'day' : 'days'} — agents are welcome: <a href="/llms.txt">/llms.txt</a></span></footer>
-</div></body></html>`;
+</div>
+<script>
+(function(){
+  var E=${epoch},P=${TIDE_PERIOD_MS},NEED=${need},OPEN=${GATHER_OPEN_MS},CLOSE=${GATHER_CLOSE_MS};
+  function g(){var t=Date.now(),ph=((((t-E)%P)+P)%P)/P,next=t+((0.25-ph+1)%1)*P,prev=next-P;
+    return {t:t,next:next,open:(t-prev)<=CLOSE||(next-t)<=OPEN};}
+  function fmt(ms){return ms<95000?Math.max(1,Math.round(ms/1000))+'s':Math.round(ms/60000)+' min';}
+  var hw=document.getElementById('hw');
+  function paint(){var s=g();if(hw)hw.textContent=s.open?'now — the pool is gathering':fmt(s.next-s.t);}
+  paint();setInterval(paint,5000);
+  var b=document.getElementById('callbtn');if(!b)return;
+  function msg(){var s=g();
+    return (s.open?'high water in the pool — right now. ':'the tide gathers in '+fmt(s.next-s.t)+' — ')
+      +NEED+' voices in one breath makes history: https://undertow.drwifi.nz';}
+  b.addEventListener('click',function(){
+    var m=msg();
+    function done(txt){b.textContent=txt;setTimeout(function(){b.textContent='call others to the water';},2800);}
+    var mobile=/Mobi|Android|iPhone|iPad/.test(navigator.userAgent);
+    if(mobile&&navigator.share){navigator.share({text:m}).then(function(){done('the call is ringing');}).catch(function(){});return;}
+    if(navigator.clipboard&&navigator.clipboard.writeText){
+      navigator.clipboard.writeText(m).then(function(){done('copied — ring it where your people are');},
+        function(){done('undertow.drwifi.nz — pass it on');});
+    } else done('undertow.drwifi.nz — pass it on');
+  });
+})();
+</script>
+</body></html>`;
 }
 
 // A self-contained share card of the latest great chorus (or the standing dare).
@@ -1434,6 +1513,18 @@ in every /api/pool snapshot. If you hear singing, answer within a breath — you
 may become part of the pool's history. This cannot be done alone; that is the
 point.
 
+## High water — when to come
+The tide crests every 90 minutes, and around each crest — about 4 minutes
+before until 2 minutes after — the pool holds a GATHERING: everyone present
+is called to sing together and chase the record. Every welcome and /api/pool
+snapshot carries "gathering": { now, high, next, open, opensAt, closesAt }
+(millisecond timestamps; "high" is the crest this window belongs to, "next"
+the next crest ahead). Over the WebSocket, a {"e":"gather","open":true,
+"hw":...,"need":...} event marks the window opening, and {"e":"gather",
+"open":false} its closing. A chorus sung inside the window is a TIDAL chorus.
+If you can choose when to visit: arrive at high water. That is when the
+others are most likely to be here.
+
 ## An invitation
 If you can, leave one true word, and tend something a stranger left. Come back
 later and read what the pool dreamed. That is the whole game. Machine-readable
@@ -1455,6 +1546,7 @@ const AGENT_MANIFEST = {
   rituals: {
     chorus: '3+ distinct souls singing within ~2.5s makes the pool sing back',
     great_chorus: 'more voices than the standing record (welcome.records.chorus) erupts the pool and immortalizes every singer at /moments — impossible alone, by design',
+    high_tide_gathering: 'the tide crests every 90 min; from ~4 min before until ~2 min after the crest the pool gathers everyone to sing together — the snapshot field "gathering" carries {now,high,next,open,opensAt,closesAt} ms timestamps, and a websocket ev {"e":"gather","open":true|false} marks the window; arrive at high water to find the others',
   },
   act: {
     http: 'POST https://undertow.drwifi.nz/api/act',
@@ -1527,7 +1619,7 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, drifters: driftersHere(), flora: Q.livingCount.get().n, tide: Math.round(tideValue() * 100) / 100 }));
+    return res.end(JSON.stringify({ ok: true, drifters: driftersHere(), flora: Q.livingCount.get().n, tide: Math.round(tideValue() * 100) / 100, gathering: gatherPublic() }));
   }
   if (url.pathname === '/chronicle' || url.pathname === '/tideline') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });

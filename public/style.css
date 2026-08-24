@@ -146,6 +146,11 @@ body.awake #hud2 { opacity: .8; }
   animation: darebreath 3.4s ease-in-out infinite;
 }
 @keyframes darebreath { 50% { opacity: .55; } }
+/* the gathering: high water is the appointed hour, and the line glows brighter for it */
+#hud2.tide {
+  color: #9be9dd;
+  text-shadow: 0 0 18px rgba(79, 216, 196, .65);
+}
 
 /* ── connection lamp ──────────────────────────────────────────────────── */
 
