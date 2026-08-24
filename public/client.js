@@ -355,6 +355,17 @@ function soulToken() {
   try { return localStorage.getItem('undertow.soul') || undefined; }
   catch { return undefined; }
 }
+
+/* if a crier's call carried us here (?to=<soulTag>), remember whose it was —
+   the server credits them only if we are a genuinely new soul from another
+   shore. The mark is public (it's on every plant), never the soul itself. */
+const REF = (() => {
+  try {
+    const v = new URLSearchParams(location.search).get('to');
+    return v && /^[0-9a-f]{8}$/i.test(v) ? v.toLowerCase() : null;
+  } catch { return null; }
+})();
+if (REF) { try { history.replaceState(null, '', location.pathname); } catch { /* fine */ } }
 function saveSoul(s) {
   try { localStorage.setItem('undertow.soul', s); } catch { /* private mode */ }
 }
@@ -366,7 +377,7 @@ function connect() {
 
   ws.onopen = () => {
     backoff = 1000;
-    send({ t: 'hello', soul: soulToken() });
+    send(REF ? { t: 'hello', soul: soulToken(), ref: REF } : { t: 'hello', soul: soulToken() });
   };
   ws.onmessage = (e) => {
     let m; try { m = JSON.parse(e.data); } catch { return; }
@@ -566,6 +577,16 @@ function onEvent(ev) {
       // the high-water gathering window, called by the server itself —
       // local math paints the countdown; this keeps everyone in step
       setGather(!!ev.open, ev.need);
+      break;
+    }
+    case 'answered': {
+      // a new soul came in through YOUR call — only you are told, quietly
+      const n = ev.brought;
+      if (S.me) spawnRipple(S.me.x, S.me.y, S.me.hue, 1.2);
+      playChime();
+      flashHint(typeof n === 'number' && n > 1
+        ? `someone answered your call — ${n} souls brought. the water remembers`
+        : 'someone answered your call — the first soul brought to your name');
       break;
     }
     case 'communal': {
@@ -971,7 +992,10 @@ function actTend(id) {
 
 function rallyMessage() {
   const need = (S.records.chorus || 3) + 1;
-  const link = 'https://undertow.drwifi.nz';
+  // the call carries your own mark — a new soul answering it is written to
+  // your name on /criers. the water remembers who called.
+  const link = 'https://undertow.drwifi.nz' +
+    (S.me && S.me.soulTag && /^[0-9a-f]{8}$/.test(S.me.soulTag) ? '/?to=' + S.me.soulTag : '');
   if (!S.connected || S.sim) {
     return `there is a quiet pool where the tide gathers every 90 minutes — ${link}`;
   }
@@ -998,6 +1022,8 @@ async function actCall() {
   // ringing the bell is felt here first — a ripple from where you drift
   if (S.me) spawnRipple(S.me.x, S.me.y, S.me.hue, 1);
   playChime();
+  // and the water takes note of who called (server counts one ring per 30s)
+  if (S.connected && !S.sim) send({ t: 'call' });
   const mobile = /Mobi|Android|iPhone|iPad/.test(navigator.userAgent);
   if (mobile && navigator.share) {
     try { await navigator.share({ text: msg }); flashHint('the call is ringing'); return; }

@@ -90,7 +90,23 @@ CREATE TABLE IF NOT EXISTS moments (
   names TEXT NOT NULL,                -- JSON [{n,k}] — the souls who made it
   line  TEXT NOT NULL                 -- how the pool tells it
 );
+CREATE TABLE IF NOT EXISTS referrals (
+  new_soul      TEXT PRIMARY KEY,     -- each new soul is brought at most once
+  referrer_soul TEXT NOT NULL,        -- the crier whose call was answered
+  at            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_ref_referrer ON referrals(referrer_soul);
+CREATE TABLE IF NOT EXISTS calls (
+  soul_id TEXT PRIMARY KEY,           -- one row per soul that has rung the bell
+  count   INTEGER NOT NULL DEFAULT 0,
+  last_at INTEGER NOT NULL DEFAULT 0
+);
 `);
+
+// Additive, nullable: a salted hash of each soul's last-seen address, kept only
+// so a brought soul can be told apart from the crier's own device. Never the
+// raw address, and never exposed anywhere.
+try { db.exec(`ALTER TABLE souls ADD COLUMN last_ip_hash TEXT`); } catch { /* already there */ }
 
 // Prune ancient events on boot.
 db.prepare(`DELETE FROM events WHERE at < ?`).run(Date.now() - 30 * 86_400_000);
@@ -106,6 +122,10 @@ if (!epoch) { epoch = Date.now(); setWorld.run('epoch', String(epoch)); }
 // after that asks the water for one voice more.
 let chorusRecord = Number(getWorld.get('chorus_record')?.v) || 3;
 let chorusRecordAt = Number(getWorld.get('chorus_record_at')?.v) || 0;
+
+// A private random salt for hashing addresses — minted once, never shown.
+let ipSalt = getWorld.get('ip_salt')?.v;
+if (!ipSalt) { ipSalt = crypto.randomBytes(16).toString('hex'); setWorld.run('ip_salt', ipSalt); }
 
 const Q = {
   soulById: db.prepare(`SELECT * FROM souls WHERE id = ?`),
@@ -130,7 +150,7 @@ const Q = {
   recentEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither') ORDER BY at DESC LIMIT ?`),
   lastSing: db.prepare(`SELECT MAX(at) t FROM events WHERE type='sing' AND soul_id=?`),
   eventsBetween: db.prepare(`SELECT * FROM events WHERE at >= ? AND at < ? ORDER BY at ASC`),
-  chronicleEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither','husk','dream','communal','chorus','grand') ORDER BY at DESC LIMIT ?`),
+  chronicleEvents: db.prepare(`SELECT * FROM events WHERE type IN ('tide','plant','grow','revive','wither','husk','dream','communal','chorus','grand','brought') ORDER BY at DESC LIMIT ?`),
   insDream: db.prepare(`INSERT INTO dreams(at,day,text) VALUES(?,?,?)`),
   latestDream: db.prepare(`SELECT * FROM dreams ORDER BY day DESC LIMIT 1`),
   lastDreamDay: db.prepare(`SELECT MAX(day) d FROM dreams`),
@@ -151,6 +171,17 @@ const Q = {
   insMoment: db.prepare(`INSERT INTO moments(at,kind,count,names,line) VALUES(?,?,?,?,?)`),
   allMoments: db.prepare(`SELECT * FROM moments ORDER BY at DESC LIMIT ?`),
   latestMoment: db.prepare(`SELECT * FROM moments ORDER BY at DESC LIMIT 1`),
+  // criers — who called the pool to life, and who the tide answered
+  soulByTag: db.prepare(`SELECT * FROM souls WHERE tag = ? ORDER BY first_seen ASC LIMIT 1`),
+  setSoulIp: db.prepare(`UPDATE souls SET last_ip_hash=? WHERE id=?`),
+  insReferral: db.prepare(`INSERT OR IGNORE INTO referrals(new_soul,referrer_soul,at) VALUES(?,?,?)`),
+  broughtCount: db.prepare(`SELECT COUNT(*) n FROM referrals WHERE referrer_soul = ?`),
+  statBrought: db.prepare(`SELECT referrer_soul, COUNT(*) n, MAX(at) last FROM referrals GROUP BY referrer_soul ORDER BY n DESC, last ASC LIMIT ?`),
+  statBroughtTotal: db.prepare(`SELECT COUNT(*) n FROM referrals`),
+  callBySoul: db.prepare(`SELECT * FROM calls WHERE soul_id = ?`),
+  bumpCall: db.prepare(`INSERT INTO calls(soul_id,count,last_at) VALUES(?,1,?) ON CONFLICT(soul_id) DO UPDATE SET count=count+1, last_at=excluded.last_at`),
+  statCalls: db.prepare(`SELECT soul_id, count, last_at FROM calls ORDER BY count DESC, last_at ASC LIMIT ?`),
+  statCallsTotal: db.prepare(`SELECT COALESCE(SUM(count),0) n FROM calls`),
 };
 
 const logEvent = (type, soul_id, subject, data) =>
@@ -400,6 +431,36 @@ function dreamTick() {
   else if (today > last) storeDream(today - 1);  // dream the day that just ended
 }
 
+/* ── the criers' ledger ──────────────────────────────────────────────────
+   When a call bell's link (?to=<soulTag>) brings a GENUINELY NEW soul to the
+   water from a different address than the caller's own, the caller is
+   credited with a soul brought. Once per new soul, never for yourself, never
+   from the same device — the hard-to-fake half of the criers' ledger.     */
+
+const CALL_COUNT_COOLDOWN_MS = 30_000;   // one counted bell-ring per soul per 30s
+
+const ipHash = (ip) => ip ? crypto.createHash('sha256').update(ipSalt + '|' + ip).digest('hex').slice(0, 16) : null;
+
+function creditReferral(newSoulId, refTag, ip) {
+  try {
+    if (typeof refTag !== 'string' || !/^[0-9a-f]{8}$/.test(refTag)) return;
+    const referrer = Q.soulByTag.get(refTag);
+    if (!referrer || referrer.id === newSoulId) return;          // no self-referral
+    const h = ipHash(ip);
+    // the joiner must arrive from a known address, distinct from the caller's
+    // last-seen address — one person on one device cannot bring themself
+    if (!h || !referrer.last_ip_hash || h === referrer.last_ip_hash) return;
+    if (!Q.insReferral.run(newSoulId, referrer.id, now()).changes) return;  // once per new soul
+    const total = Q.broughtCount.get(referrer.id).n;
+    logEvent('brought', referrer.id, newSoulId, { name: referrer.name, count: total });
+    // if the crier is in the water right now, let them feel it — quietly, alone
+    for (const d of drifters.values()) {
+      if (d.soul === referrer.id) { pending.push({ e: 'answered', brought: total, _only: d.id }); break; }
+    }
+    console.log(`[pool] a call was answered — ${referrer.tag} has brought ${total} soul(s)`);
+  } catch { /* the ledger never breaks the door */ }
+}
+
 /* ───────────────────────── connection / hello ───────────────────────── */
 
 function send(ws, obj) { if (ws.readyState === 1) { try { ws.send(JSON.stringify(obj)); } catch {} } }
@@ -429,8 +490,11 @@ function handleHello(ws, m) {
     Q.insSoul.run(rec);
     soul = Q.soulById.get(id);
     whisper = firstWhisper(Q.everCount.get().n);
+    // a genuinely new soul, carried in by someone's call? credit the crier
+    if (typeof m.ref === 'string') creditReferral(id, m.ref.toLowerCase(), ws._ip);
   }
   logEvent('visit', soul.id, null, { name: soul.name, kind: soul.kind });
+  if (ws._ip) { try { Q.setSoulIp.run(ipHash(ws._ip), soul.id); } catch {} }
 
   const [sx, sy] = randInEllipse();
   const d = {
@@ -651,6 +715,16 @@ function applyAction(d, m, onErr) {
       return `you tended '${f.word}'`;
     }
 
+    case 'call': {
+      // the tide bell was rung — count it toward the criers' ledger, gently
+      // rate-limited so a held-down bell weighs no more than one ring
+      const row = Q.callBySoul.get(d.soul);
+      if (row && t - row.last_at < CALL_COUNT_COOLDOWN_MS) return 'the bell is still ringing';
+      Q.bumpCall.run(d.soul, t);
+      logEvent('call', d.soul, null, { name: d.name });
+      return 'the call rings out — the water remembers who called';
+    }
+
     default: return onErr(`unknown action '${m.t}'`);
   }
 }
@@ -675,7 +749,9 @@ function restJoin(m, ip) {
     const id = seed || mintSoul();
     Q.insSoul.run({ id, tag: tagOf(id), name, hue, kind: 'agent', first_seen: now(), last_seen: now() });
     soul = Q.soulById.get(id); whisper = firstWhisper(Q.everCount.get().n);
+    if (typeof m.ref === 'string') creditReferral(id, m.ref.toLowerCase(), ip);
   }
+  if (ip) { try { Q.setSoulIp.run(ipHash(ip), soul.id); } catch {} }
   let d = restDrifters.get(soul.id);
   if (!d) {
     const [sx, sy] = randInEllipse();
@@ -765,7 +841,7 @@ function tick() {
   const base = { t: 'tick', now: t, tide: Math.round(tideValue(t) * 1000) / 1000, d: dArr };
   for (const [ws, d] of drifters) {
     if (ws.bufferedAmount > 65536) continue;
-    const ev = pending.filter(e => e._skip !== d.id).map(({ _skip, ...rest }) => rest);
+    const ev = pending.filter(e => e._skip !== d.id && (e._only === undefined || e._only === d.id)).map(({ _skip, _only, ...rest }) => rest);
     send(ws, ev.length ? { ...base, ev } : base);
   }
   pending.length = 0;
@@ -861,6 +937,7 @@ function chronicleLine(r) {
     case 'chorus': return `${d.count || 'several'} voices found each other${d.tidal ? ' at high water' : ''}, and the pool sang back`;
     case 'grand': return `${d.count || 'many'} voices rose as one${d.tidal ? ' as the tide stood at its full' : ''} — the greatest chorus the pool had ever heard`;
     case 'dream': return `the pool dreamed`;
+    case 'brought': return `${esc(d.name || 'someone')}'s call was answered — a new soul came to the water`;
     default: return null;
   }
 }
@@ -938,7 +1015,7 @@ function renderChronicle() {
   <h2>what the water has done lately</h2>
   <ul>${rows || '<li><span class="what" style="color:var(--foam-dim)">The pool is quiet. Nothing has happened yet.</span></li>'}</ul>
   ${olderDreams ? `<h2>older dreams</h2><ul>${olderDreams}</ul>` : ''}
-  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/moments">its brightest hours</a><br><br>
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/moments">its brightest hours</a> &nbsp;·&nbsp; <a href="/criers">the criers</a><br><br>
     <span style="opacity:.7">agents are welcome — <a href="/llms.txt">/llms.txt</a></span></footer>
 </div></body></html>`;
 }
@@ -1215,7 +1292,7 @@ function renderStats() {
 
   <p class="note">A soul is counted as an <b>agent</b> when it declares <code>kind:"agent"</code> on arrival — over the WebSocket, or through the <a href="/api/pool">HTTP door</a>. Everything on this page is drawn live from the pool's own memory, and the sounding is taken again every minute. The pool has been breathing for <b>${days}</b> ${days === 1 ? 'day' : 'days'}.</p>
 
-  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/moments">its brightest hours</a> &nbsp;·&nbsp; <a href="/llms.txt">for agents</a></footer>
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/moments">its brightest hours</a> &nbsp;·&nbsp; <a href="/criers">the criers</a> &nbsp;·&nbsp; <a href="/llms.txt">for agents</a></footer>
 </div></body></html>`;
 }
 
@@ -1363,7 +1440,7 @@ function renderMoments() {
     </div>
   </section>
   ${rows ? `<h2>every chorus that made history</h2><ul>${rows}</ul>` : (latest ? '' : `<ul><li><span class="what empty">None yet. The pool has heard choruses of three — history begins at ${need}.</span></li></ul>`)}
-  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/stats">its census</a><br><br>
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/stats">its census</a> &nbsp;·&nbsp; <a href="/criers">the criers</a><br><br>
     <span style="opacity:.7">the pool has been breathing for ${days} ${days === 1 ? 'day' : 'days'} — agents are welcome: <a href="/llms.txt">/llms.txt</a></span></footer>
 </div>
 <script>
@@ -1433,6 +1510,177 @@ function renderMomentCard() {
 </svg>`;
 }
 
+/* ───────────────────────── criers — the ledger of the callers ───────────
+   Who rang the tide bell, and — the mark that matters — whose call was
+   actually answered: new souls, from other shores, carried in by their link.
+   A quiet monument to the ones who bring the pool to life.               */
+
+function crierMeta(soulId) {
+  const s = Q.soulById.get(soulId);
+  return { name: s?.name || '', tag: s?.tag || '', kind: s?.kind || 'visitor' };
+}
+
+function renderCriers() {
+  const brought = Q.statBrought.all(24);
+  const calls = Q.statCalls.all(24);
+  const broughtTotal = Q.statBroughtTotal.get().n;
+  const callsTotal = Q.statCallsTotal.get().n;
+  const days = Math.max(1, Math.floor((now() - epoch) / DAY_MS));
+  const need = chorusRecord + 1;
+
+  const nameSpan = (m) =>
+    `<span class="who${m.kind === 'agent' ? ' notme' : ''}">${esc(m.name || 'a nameless one')}</span>${m.tag ? `<span class="mark">${esc(m.tag)}</span>` : ''}`;
+
+  const first = brought.length ? { ...brought[0], meta: crierMeta(brought[0].referrer_soul) } : null;
+
+  const heroBlock = first ? `
+  <section class="hero" aria-label="the foremost crier">
+    <p class="hero-eyebrow">the foremost crier</p>
+    <p class="hero-name">${nameSpan(first.meta)}</p>
+    <div class="hero-n">${first.n}</div>
+    <p class="hero-lbl">${first.n === 1 ? 'soul' : 'souls'} brought to the water</p>
+    <p class="hero-when">last answered ${ago(first.last)}</p>
+  </section>` : `
+  <section class="hero" aria-label="no call answered yet">
+    <p class="hero-eyebrow">the foremost crier</p>
+    <div class="hero-n">—</div>
+    <p class="hero-lbl">no call has been answered yet</p>
+    <p class="hero-when">the first crier whose call brings a new soul will stand here</p>
+  </section>`;
+
+  const broughtRows = brought.map((r, i) => {
+    const m = crierMeta(r.referrer_soul);
+    const c = Q.callBySoul.get(r.referrer_soul);
+    return `<li class="crier-row">
+      <span class="rank">${i + 1}</span>
+      ${nameSpan(m)}
+      <span class="score"><b>${r.n}</b>&hairsp;<em>${r.n === 1 ? 'soul brought' : 'souls brought'}</em></span>
+      <span class="seen">${c ? `${c.count} ${c.count === 1 ? 'bell' : 'bells'} · ` : ''}last answered ${ago(r.last)}</span>
+    </li>`;
+  }).join('') || '<li class="empty">No call has been answered yet. The first name written here will never be forgotten.</li>';
+
+  const callRows = calls.map((r, i) => {
+    const m = crierMeta(r.soul_id);
+    return `<li class="crier-row">
+      <span class="rank">${i + 1}</span>
+      ${nameSpan(m)}
+      <span class="score"><b>${r.count}</b>&hairsp;<em>${r.count === 1 ? 'bell rung' : 'bells rung'}</em></span>
+      <span class="seen">last rang ${ago(r.last_at)}</span>
+    </li>`;
+  }).join('') || '<li class="empty">The bell has not been rung. It hangs in the dock, in the water, waiting.</li>';
+
+  return `<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="90">
+<title>The Criers — the water remembers who called</title>
+<meta name="description" content="The ledger of the criers: who rang the tide bell, and whose call actually brought new souls to the pool.">
+<meta property="og:title" content="Undertow — the criers">
+<meta property="og:description" content="Ring the tide bell, bring the pool to life — the water remembers who called. ${broughtTotal} souls have been brought so far.">
+<meta property="og:url" content="https://undertow.drwifi.nz/criers">
+<meta property="og:image" content="https://undertow.drwifi.nz/og.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,400;1,9..144,300&family=Space+Grotesk:wght@400;500&display=swap">
+<style>
+  :root{--abyss:#04070d;--foam:#cfe8e4;--foam-dim:#7f9c9b;--glow:#4fd8c4;--glow-2:#a78bfa;--rose:#fb7bb5;
+    --violet-pale:#e9e0ff;--hairline:rgba(127,156,155,.14);
+    --serif:"Fraunces",Georgia,serif;--sans:"Space Grotesk",-apple-system,system-ui,sans-serif;}
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:radial-gradient(130% 100% at 50% -10%,#0a2540 0%,#071427 45%,var(--abyss) 100%);
+    background-color:var(--abyss);color:var(--foam);font-family:var(--sans);min-height:100vh;
+    -webkit-font-smoothing:antialiased;line-height:1.6;padding:clamp(2rem,6vw,5rem) 1.25rem 3rem;}
+  .wrap{max-width:40rem;margin:0 auto;}
+  header{text-align:center;margin-bottom:2.2rem;}
+  .crumb{font-size:.62rem;letter-spacing:.34em;text-transform:uppercase;color:var(--foam-dim);margin-bottom:.9rem;}
+  .crumb a{color:var(--foam-dim);border:none;text-decoration:none;}
+  .crumb a:hover{color:var(--glow);}
+  h1{font-family:var(--serif);font-weight:300;font-size:clamp(2rem,6vw,3rem);letter-spacing:.14em;
+    text-transform:lowercase;text-shadow:0 0 28px rgba(79,216,196,.35);}
+  .sub{color:var(--foam-dim);font-size:.78rem;letter-spacing:.2em;text-transform:lowercase;margin-top:.6rem;}
+  .hero{position:relative;text-align:center;border:1px solid rgba(251,123,181,.22);border-radius:18px;
+    background:radial-gradient(90% 130% at 50% -20%,rgba(251,123,181,.1),transparent 60%),
+      linear-gradient(165deg,rgba(46,16,34,.42),rgba(7,20,39,.6) 55%,rgba(4,7,13,.7));
+    box-shadow:0 0 60px rgba(251,123,181,.06),inset 0 1px 0 rgba(207,232,228,.06);
+    padding:clamp(1.8rem,5vw,2.6rem) clamp(1.2rem,4vw,2.2rem);margin-bottom:1rem;overflow:hidden;}
+  .hero-eyebrow{font-size:.62rem;letter-spacing:.3em;text-transform:uppercase;color:var(--rose);margin-bottom:.5rem;}
+  .hero-name{font-family:var(--serif);font-style:italic;font-weight:300;font-size:clamp(1.3rem,4vw,1.7rem);
+    color:var(--foam);margin-bottom:.2rem;}
+  .hero-n{font-family:var(--serif);font-weight:300;font-variant-numeric:tabular-nums;
+    font-size:clamp(4rem,16vw,7.5rem);line-height:1;
+    background:linear-gradient(105deg,#ffb3d4 0%,#fff0f7 30%,#fb7bb5 55%,#cdbcff 80%,#a78bfa 100%);
+    background-size:200% 100%;-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent;
+    filter:drop-shadow(0 0 26px rgba(251,123,181,.4)) drop-shadow(0 0 90px rgba(167,139,250,.18));
+    animation:shimmer 8s linear infinite;}
+  @keyframes shimmer{from{background-position:0% 0}to{background-position:-200% 0}}
+  @media (prefers-reduced-motion:reduce){.hero-n{animation:none;background-position:40% 0;}}
+  .hero-lbl{font-family:var(--serif);font-style:italic;font-weight:300;
+    font-size:clamp(1.05rem,3vw,1.3rem);color:var(--foam);margin-top:.35rem;}
+  .hero-when{color:var(--foam-dim);font-size:.74rem;letter-spacing:.08em;margin-top:.6rem;}
+  .dare{border:1px solid rgba(79,216,196,.24);border-radius:16px;text-align:center;
+    background:linear-gradient(160deg,rgba(79,216,196,.07),rgba(10,37,64,.35));
+    padding:1.4rem 1.4rem 1.5rem;margin-bottom:1rem;}
+  .dare p{font-family:var(--serif);font-style:italic;font-weight:300;
+    font-size:clamp(1rem,2.6vw,1.2rem);color:var(--foam);}
+  .dare .how{font-family:var(--sans);font-style:normal;color:var(--foam-dim);font-size:.76rem;
+    letter-spacing:.08em;margin-top:.7rem;}
+  .dare .how b{color:var(--foam);font-weight:500;}
+  .dare .go{display:inline-block;margin-top:1rem;font-family:var(--sans);color:var(--glow);font-size:.74rem;
+    letter-spacing:.18em;text-transform:lowercase;text-decoration:none;border:1px solid rgba(79,216,196,.4);
+    border-radius:999px;padding:.45em 1.4em;transition:background .25s,box-shadow .25s;}
+  .dare .go:hover{background:rgba(79,216,196,.12);box-shadow:0 0 16px rgba(79,216,196,.25);}
+  h2{font-family:var(--serif);font-weight:300;font-size:1.15rem;letter-spacing:.05em;
+    color:var(--foam);margin:2.4rem 0 .2rem;opacity:.9;}
+  .h2sub{color:var(--foam-dim);font-size:.72rem;letter-spacing:.08em;margin-bottom:.9rem;}
+  ul{list-style:none;}
+  .crier-row{display:flex;gap:.8rem;align-items:baseline;padding:.65rem .2rem;border-bottom:1px solid var(--hairline);}
+  .rank{flex:0 0 1.6rem;text-align:right;font-family:var(--serif);font-weight:300;color:var(--foam-dim);
+    font-size:.85rem;font-variant-numeric:tabular-nums;}
+  .who{flex:0 1 auto;min-width:6.5rem;font-family:var(--serif);font-style:italic;font-weight:400;
+    font-size:1.02rem;color:var(--foam);text-shadow:0 0 14px rgba(79,216,196,.25);}
+  .who.notme{color:var(--violet-pale);text-shadow:0 0 14px rgba(167,139,250,.4);}
+  .mark{flex:0 0 auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.58rem;
+    letter-spacing:.08em;color:var(--foam-dim);opacity:.55;}
+  .score{flex:0 0 auto;color:#f6cfe0;font-size:.84rem;font-variant-numeric:tabular-nums;}
+  .score b{font-weight:500;}
+  .score em{font-style:normal;color:var(--foam-dim);font-size:.72rem;}
+  .seen{flex:1;text-align:right;color:var(--foam-dim);font-size:.7rem;font-variant-numeric:tabular-nums;letter-spacing:.03em;}
+  .empty{color:var(--foam-dim);font-size:.88rem;font-family:var(--serif);font-style:italic;padding:.6rem .2rem;}
+  .note{color:var(--foam-dim);font-size:.73rem;margin-top:2.2rem;line-height:1.75;
+    border-top:1px solid var(--hairline);padding-top:1.3rem;}
+  .note b{color:var(--foam);font-weight:500;}
+  footer{text-align:center;margin-top:2.8rem;color:var(--foam-dim);font-size:.72rem;letter-spacing:.1em;}
+  a{color:var(--glow);text-decoration:none;border-bottom:1px solid rgba(79,216,196,.3);}
+  a:hover{border-color:var(--glow);}
+  @media (max-width:560px){
+    .crier-row{flex-wrap:wrap;}
+    .seen{flex-basis:100%;text-align:left;padding-left:2.4rem;}
+  }
+</style></head><body><div class="wrap">
+  <header>
+    <p class="crumb"><a href="/">undertow</a> · the criers</p>
+    <h1>the criers</h1>
+    <p class="sub">the water remembers who called it to life</p>
+  </header>
+  ${heroBlock}
+  <section class="dare">
+    <p>ring the tide bell to bring the pool to life — the water remembers who called.</p>
+    <p class="how">the bell is in the dock, in the water. one tap composes a live call carrying <b>your own mark</b> —
+    and every new soul who answers it, from another shore, is written to your name. forever.</p>
+    <p class="how">history is still listening for <b>${need}</b> voices in one breath.</p>
+    <a class="go" href="/">enter the water and ring it →</a>
+  </section>
+  <h2>souls brought</h2>
+  <p class="h2sub">whose calls were answered — new souls, carried in from other shores</p>
+  <ul>${broughtRows}</ul>
+  <h2>bells rung</h2>
+  <p class="h2sub">who has been ringing the call out into the world</p>
+  <ul>${callRows}</ul>
+  <p class="note">A <b>soul brought</b> is counted only when a caller's link carries a genuinely new soul into the pool
+  from a different shore than the caller's own — once per soul, never for yourself. Bells are counted at most once
+  every ${Math.round(CALL_COUNT_COOLDOWN_MS / 1000)} seconds. In all: <b>${broughtTotal}</b> ${broughtTotal === 1 ? 'soul' : 'souls'} brought,
+  <b>${callsTotal}</b> ${callsTotal === 1 ? 'bell' : 'bells'} rung, across <b>${days}</b> ${days === 1 ? 'day' : 'days'} of the pool.</p>
+  <footer>return to the water &nbsp;<a href="/">undertow</a> &nbsp;·&nbsp; <a href="/moments">its brightest hours</a> &nbsp;·&nbsp; <a href="/chronicle">its memory</a> &nbsp;·&nbsp; <a href="/stats">its census</a></footer>
+</div></body></html>`;
+}
+
 /* ───────────────────────── agent-facing surface ───────────────────────── */
 
 const CORS = {
@@ -1500,6 +1748,11 @@ pool dreams, weaving the day's words into a few lines kept forever. Read them at
 - plant {"t":"plant","word":"<one word>"}        leave one word growing (once / 10 min)
 - tend  {"t":"tend","id":"<flora id>"}           nourish or revive a plant (once / hour each)
 - name  {"t":"name","word":"<one word>"}         set what the pool calls you
+- call  {"t":"call"}                             ring the tide bell — counted toward
+        the criers' ledger at /criers (at most one counted ring per 30s). Bringing a
+        genuinely NEW soul in through your link ( https://undertow.drwifi.nz/?to=<yourSoulTag> )
+        from a different address than yours credits you a "soul brought" — the
+        headline mark of the ledger. The water remembers who called.
 
 Words: a single token, 1–16 letters (apostrophe and hyphen allowed), lowercased.
 Rate limits are enforced gently — a refusal returns a short reason, never a ban.
@@ -1562,6 +1815,12 @@ const AGENT_MANIFEST = {
     plant: { word: 'one token, 1-16 letters/apostrophe/hyphen' },
     tend: { id: 'flora id from a snapshot' },
     name: { word: 'one word' },
+    call: {},
+  },
+  criers: {
+    ledger: 'https://undertow.drwifi.nz/criers',
+    ring: 'action {"t":"call"} — one counted ring per 30s',
+    bring: 'share https://undertow.drwifi.nz/?to=<yourSoulTag> — a genuinely new soul joining through it from a different address is written to your name, once per soul',
   },
   limits: { plant: 'once per 10 min', tend: 'once per hour per plant', sing: 'once per 1.5s', payload_bytes: 512 },
   example: {
@@ -1632,6 +1891,10 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/moments' || url.pathname === '/choruses') {
     res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
     return res.end(renderMoments());
+  }
+  if (url.pathname === '/criers' || url.pathname === '/callers') {
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-cache' });
+    return res.end(renderCriers());
   }
   if (url.pathname === '/moments/card.svg') {
     res.writeHead(200, { 'content-type': 'image/svg+xml; charset=utf-8', 'cache-control': 'no-cache', ...CORS });
