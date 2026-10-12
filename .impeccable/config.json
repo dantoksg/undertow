@@ -1,0 +1,34 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "overused-font",
+        "value": "fraunces",
+        "createdAt": "2026-08-23T14:40:50.776Z",
+        "reason": "Claude: matches Undertow's established client typography (Fraunces+Space Grotesk in public/style.css) for a consistent chronicle page"
+      },
+      {
+        "rule": "overused-font",
+        "value": "space grotesk",
+        "createdAt": "2026-08-23T22:51:07.286Z",
+        "reason": "Claude: Undertow's established UI typeface (Fraunces+Space Grotesk site-wide); og card matches the design system"
+      },
+      {
+        "rule": "dark-glow",
+        "value": "*",
+        "files": [
+          "public/og.html"
+        ],
+        "createdAt": "2026-08-23T22:58:54.063Z",
+        "reason": "Claude: bioluminescence is Undertow's core visual language (glow on wordmark/plants/drifters site-wide); the share card matches it intentionally"
+      },
+      {
+        "rule": "dark-glow",
+        "value": "text-shadow: 0 0 46px rgba(79,216,196,.4), 0 0 14px rgba(79,216,196,.2)",
+        "createdAt": "2026-08-23T23:34:10.500Z"
+      }
+    ]
+  }
+}
